@@ -177,9 +177,7 @@ func (c *RemoteAPIChat) BuildChatCompletionRequest(messages []Message, opts *Cha
 	}
 
 	if opts != nil {
-		if opts.Temperature > 0 {
-			req.Temperature = float32(opts.Temperature)
-		}
+		req.Temperature = float32(opts.Temperature)
 		if opts.TopP > 0 {
 			req.TopP = float32(opts.TopP)
 		}
@@ -548,7 +546,20 @@ func (c *RemoteAPIChat) processRawHTTPStream(ctx context.Context, resp *http.Res
 	for {
 		event, err := reader.ReadEvent()
 		if err != nil {
-			if err != io.EOF {
+			if err == io.EOF {
+				// 部分模型不发送 [DONE] 标记，直接关闭连接，视为正常结束
+				if state.usage != nil {
+					logger.Infof(ctx, "[LLM Usage] model=%s, prompt_tokens=%d, completion_tokens=%d, total_tokens=%d",
+						c.modelName, state.usage.PromptTokens, state.usage.CompletionTokens, state.usage.TotalTokens)
+				}
+				streamChan <- types.StreamResponse{
+					ResponseType: types.ResponseTypeAnswer,
+					Content:      "",
+					Done:         true,
+					ToolCalls:    state.buildOrderedToolCalls(),
+					Usage:        state.usage,
+				}
+			} else {
 				logger.Errorf(ctx, "Stream read error: %v", err)
 				streamChan <- types.StreamResponse{
 					ResponseType: types.ResponseTypeError,
@@ -769,7 +780,11 @@ func (c *RemoteAPIChat) processToolCallsDelta(ctx context.Context, toolCalls []o
 			toolCallEntry.Type = string(tc.Type)
 		}
 		if tc.Function.Name != "" {
-			toolCallEntry.Function.Name += tc.Function.Name
+			// 防御性校验：解决部分供应商（如vLLM Ascend等）在每个流 Chunk 中重复发送完整工具名的问题。
+			// 如果当前已存名字与新收到名字一致，则视为冗余重复，不进行叠加。
+			if toolCallEntry.Function.Name != tc.Function.Name {
+				toolCallEntry.Function.Name += tc.Function.Name
+			}
 		}
 
 		argsUpdated := false

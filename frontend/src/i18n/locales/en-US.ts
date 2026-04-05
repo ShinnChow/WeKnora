@@ -236,6 +236,7 @@ export default {
     parsingFailed: 'Parsing failed',
     parsingInProgress: 'Parsing...',
     generatingSummary: 'Generating summary...',
+    documentSummary: 'Summary',
     deleteConfirmation: 'Delete Confirmation',
     confirmDeleteDocument: 'Confirm deletion of document "{fileName}", recovery will be impossible after deletion',
     cancel: 'Cancel',
@@ -450,7 +451,11 @@ export default {
       suggestedPrompts: 'Suggested Prompts',
       mode: 'Running Mode',
       webSearch: 'Web Search',
+      webSearchProvider: 'Search Engine',
+      webSearchProviderPlaceholder: 'Use default search engine',
       webSearchMaxResults: 'Max Search Results',
+      webFetchEnabled: 'Auto-Fetch Page Content',
+      webFetchTopN: 'Pages to Fetch',
       knowledgeBases: 'Knowledge Bases',
       allKnowledgeBases: 'All Knowledge Bases',
       allKnowledgeBasesDesc: 'Agent can access all knowledge bases',
@@ -699,6 +704,34 @@ export default {
   webSearchSettings: {
     title: 'Web Search Configuration',
     description: 'Configure web search so answers can include up-to-date information from the internet.',
+    // Provider entity management
+    providersTitle: 'Search Engine Providers',
+    addProvider: 'Add Provider',
+    editProvider: 'Edit Provider',
+    noProviders: 'No search engine providers configured. Click "Add Provider" to get started.',
+    deleteConfirm: 'Are you sure you want to delete this provider?',
+    default: 'Default',
+    providerNameLabel: 'Name',
+    providerNamePlaceholder: 'e.g., Production Bing Search',
+    providerTypeLabel: 'Provider Type',
+    providerDescLabel: 'Notes',
+    providerDescPlaceholder: 'Optional, e.g., for testing',
+    engineIdLabel: 'Engine ID',
+    setAsDefault: 'Set as default',
+    testConnection: 'Test Connection',
+    testing: 'Testing...',
+    free: 'Free',
+    viewDocs: 'View docs for API key',
+    apiKeyUnchanged: 'Leave empty to keep current key',
+    noDescription: "No description provided",
+    noProvidersDesc: "Add a web search provider to enable your agents to retrieve real-time information from the internet.",
+    basicInfo: "Basic Information",
+    credentials: "Credentials",
+    setAsDefaultDesc: "This provider will be used by default when an agent doesn't specify one",
+    // Search behavior
+    searchBehaviorTitle: 'Search Behavior',
+    defaultProviderLabel: 'Default Provider',
+    defaultProviderDescription: 'Select the default search provider for agents that do not specify their own.',
     providerLabel: 'Search Provider',
     providerDescription: 'Choose the search engine service used for web search',
     providerPlaceholder: 'Select a search engine...',
@@ -722,7 +755,12 @@ export default {
     toasts: {
       loadProvidersFailed: 'Failed to load search providers: {message}',
       saveSuccess: 'Web search configuration saved',
-      saveFailed: 'Failed to save configuration: {message}'
+      saveFailed: 'Failed to save configuration: {message}',
+      providerCreated: 'Search provider created',
+      providerUpdated: 'Search provider updated',
+      providerDeleted: 'Search provider deleted',
+      testSuccess: 'Connection test succeeded',
+      testFailed: 'Connection test failed',
     }
   },
   chatHistorySettings: {
@@ -1431,7 +1469,8 @@ export default {
       advanced: 'Advanced Settings',
       faq: 'FAQ Settings',
       graph: 'Knowledge Graph',
-      multimodal: 'Multimodal',
+      multimodal: 'Image Processing',
+      asr: 'Audio Processing',
       datasource: 'Data Sources',
       share: 'Sharing'
     },
@@ -1635,8 +1674,17 @@ export default {
       childChunkSizeDescription: 'Size of child chunks used for embedding matching (64-1024)'
     },
     multimodal: {
-      title: 'Multimodal Configuration',
-      description: 'Configure multimodal content understanding for parsing and retrieving non-text content like images',
+      title: 'Image Processing Configuration',
+      description: 'Configure image content understanding for parsing and retrieving non-text content like images',
+    },
+    asr: {
+      title: 'Audio Processing Configuration',
+      description: 'Configure speech recognition to upload audio files (mp3, wav, m4a, flac, ogg) and automatically transcribe to text',
+      label: 'Enable Speech Recognition',
+      desc: 'When enabled, audio files can be uploaded to the knowledge base and automatically transcribed to text',
+      modelLabel: 'ASR Model',
+      modelDescription: 'Speech-to-text model for audio transcription (e.g. OpenAI Whisper)',
+      modelPlaceholder: 'Select an ASR model',
     },
     advanced: {
       title: 'Advanced Settings',
@@ -2038,17 +2086,20 @@ export default {
         embedding: 'Configure embedding models for text vectorization',
         rerank: 'Configure models for result re-ranking',
         vllm: 'Configure vision-language models for multimodal understanding',
+        asr: 'Configure speech-to-text models for audio transcription',
         default: 'Configure model information'
       },
       modelNamePlaceholder: {
         local: 'e.g. llama2:latest',
         remote: 'e.g. gpt-4, claude-3-opus',
         localVllm: 'e.g. llava:latest',
-        remoteVllm: 'e.g. gpt-4-vision-preview'
+        remoteVllm: 'e.g. gpt-4-vision-preview',
+        remoteAsr: 'e.g. whisper-1'
       },
       baseUrlLabel: 'Base URL',
       baseUrlPlaceholder: 'e.g. https://api.openai.com/v1',
       baseUrlPlaceholderVllm: 'e.g. http://localhost:11434/v1',
+      baseUrlPlaceholderAsr: 'e.g. https://api.openai.com/v1',
       apiKeyOptional: 'API Key (optional)',
       apiKeyPlaceholder: 'Enter API Key',
       connectionTest: 'Connection Test',
@@ -2544,6 +2595,11 @@ export default {
       desc: 'Configure vision-language models for multimodal understanding',
       empty: 'No VLLM models'
     },
+    asr: {
+      title: 'ASR Speech Models',
+      desc: 'Configure speech-to-text models for audio transcription (e.g. OpenAI Whisper)',
+      empty: 'No ASR models'
+    },
     toasts: {
       nameRequired: 'Model name cannot be empty',
       nameTooLong: 'Model name cannot exceed 100 characters',
@@ -2955,6 +3011,8 @@ export default {
     unsupportedHint: 'Please download and open with a local application',
     fullscreen: 'Fullscreen',
     exitFullscreen: 'Exit Fullscreen',
+    audioLoading: 'Loading audio…',
+    audioNotSupported: 'Your browser does not support audio playback',
   },
   knowledgeSearch: {
     title: 'Search',
@@ -3041,6 +3099,7 @@ export default {
       fileTypeText: 'Plain Text',
       fileTypeJson: 'JSON Files',
       fileTypeImage: 'Images',
+      fileTypeAudio: 'Audio Files',
       engines: {
         builtin: {
           name: 'Built-in',
@@ -3178,7 +3237,10 @@ export default {
       maxIterations: 'Maximum reasoning steps when the Agent executes tasks',
       kbScope: 'Select the scope of knowledge bases accessible to the agent',
       webSearch: 'When enabled, the agent can search the internet for information',
+      webSearchProvider: 'Specify a search engine for this agent. Leave empty to use the default.',
       webSearchMaxResults: 'Maximum number of results returned per search',
+      webFetchEnabled: 'After reranking, auto-fetch full page content from top web results for better answers',
+      webFetchTopN: 'Maximum number of web pages to fetch after reranking',
       retrievalSection: 'Configure knowledge base retrieval and ranking parameters',
       queryExpansion: 'Automatically expand query terms to improve recall',
       embeddingTopK: 'Maximum number of results from vector retrieval',

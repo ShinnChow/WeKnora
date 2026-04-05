@@ -1,6 +1,6 @@
--- Migration: 000028_datasource_tables
+-- Migration: 000029_datasource_tables
 -- Description: Create data_sources and sync_logs tables for external data source management
-DO $$ BEGIN RAISE NOTICE '[Migration 000028] Creating data_sources and sync_logs tables'; END $$;
+DO $$ BEGIN RAISE NOTICE '[Migration 000029] Creating data_sources and sync_logs tables'; END $$;
 
 -- Create data_sources table for managing external data source configurations
 CREATE TABLE IF NOT EXISTS data_sources (
@@ -56,23 +56,5 @@ CREATE INDEX IF NOT EXISTS idx_sync_logs_tenant_id ON sync_logs (tenant_id);
 CREATE INDEX IF NOT EXISTS idx_sync_logs_status ON sync_logs (status);
 CREATE INDEX IF NOT EXISTS idx_sync_logs_started_at ON sync_logs (started_at);
 
--- Trigger function to auto-update updated_at column
-CREATE OR REPLACE FUNCTION update_updated_at_column()
-RETURNS TRIGGER AS $$
-BEGIN
-    NEW.updated_at = CURRENT_TIMESTAMP;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
 
-CREATE TRIGGER trg_data_sources_updated_at
-    BEFORE UPDATE ON data_sources
-    FOR EACH ROW
-    EXECUTE FUNCTION update_updated_at_column();
-
-CREATE TRIGGER trg_sync_logs_updated_at
-    BEFORE UPDATE ON sync_logs
-    FOR EACH ROW
-    EXECUTE FUNCTION update_updated_at_column();
-
-DO $$ BEGIN RAISE NOTICE '[Migration 000028] data_sources and sync_logs tables created successfully'; END $$;
+DO $$ BEGIN RAISE NOTICE '[Migration 000029] data_sources and sync_logs tables created successfully'; END $$;

@@ -110,6 +110,17 @@ export default {
     typeURL: 'URL',
     typeManual: 'Вручную',
     typeFile: 'Файл',
+    channelLabel: 'Канал источника',
+    channelWeb: 'Веб',
+    channelApi: 'API',
+    channelBrowserExtension: 'Расширение браузера',
+    channelWechat: 'WeChat',
+    channelWecom: 'WeCom',
+    channelFeishu: 'Feishu',
+    channelDingtalk: 'DingTalk',
+    channelSlack: 'Slack',
+    channelIm: 'IM канал',
+    channelUnknown: 'Неизвестно',
     urlSource: 'Исходный URL',
     documentTitle: 'Название документа',
     webContent: 'Веб-содержимое',
@@ -197,6 +208,7 @@ export default {
     parsingFailed: 'Парсинг не удался',
     parsingInProgress: 'Парсинг...',
     generatingSummary: 'Генерация резюме...',
+    documentSummary: 'Резюме',
     deleteConfirmation: 'Подтверждение удаления',
     confirmDeleteDocument: 'Подтвердить удаление документа "{fileName}", после удаления восстановление невозможно',
     cancel: 'Отмена',
@@ -272,6 +284,7 @@ export default {
   },
   agent: {
     taskLabel: 'Задача:',
+    think: 'Размышление',
     copy: 'Копировать',
     addToKnowledgeBase: 'Добавить в базу знаний',
     updatePlan: 'Обновить план',
@@ -672,6 +685,31 @@ export default {
   webSearchSettings: {
     title: 'Настройки веб-поиска',
     description: 'Настройте веб-поиск, чтобы ответы могли включать актуальную информацию из интернета.',
+    providersTitle: 'Поисковые провайдеры',
+    addProvider: 'Добавить провайдер',
+    editProvider: 'Редактировать провайдер',
+    noProviders: 'Поисковые провайдеры не настроены. Нажмите «Добавить провайдер», чтобы начать.',
+    deleteConfirm: 'Вы уверены, что хотите удалить этот провайдер?',
+    default: 'По умолчанию',
+    providerNameLabel: 'Название',
+    providerNamePlaceholder: 'Напр., Продакшн Bing Поиск',
+    providerTypeLabel: 'Тип провайдера',
+    providerDescLabel: 'Описание',
+    engineIdLabel: 'ID движка',
+    setAsDefault: 'Установить по умолчанию',
+    free: 'Бесплатно',
+    viewDocs: 'Документация для получения ключа',
+    apiKeyUnchanged: 'Оставьте пустым, чтобы сохранить текущий ключ',
+    testConnection: 'Проверить соединение',
+    testing: 'Тестирование...',
+    noDescription: "Нет описания",
+    noProvidersDesc: "Добавьте провайдера веб-поиска, чтобы позволить вашим агентам получать информацию из Интернета в реальном времени.",
+    basicInfo: "Основная информация",
+    credentials: "Учетные данные",
+    setAsDefaultDesc: "Этот провайдер будет использоваться по умолчанию, если агент не укажет свой",
+    searchBehaviorTitle: 'Поведение поиска',
+    defaultProviderLabel: 'Провайдер по умолчанию',
+    defaultProviderDescription: 'Выберите провайдер поиска по умолчанию для агентов, не указавших собственный.',
     providerLabel: 'Провайдер поиска',
     providerDescription: 'Выберите поисковый сервис, используемый для веб-поиска',
     providerPlaceholder: 'Выберите поисковую систему...',
@@ -697,7 +735,10 @@ export default {
     toasts: {
       loadProvidersFailed: 'Не удалось загрузить список поисковых провайдеров: {message}',
       saveSuccess: 'Настройки веб-поиска сохранены',
-      saveFailed: 'Не удалось сохранить настройки: {message}'
+      saveFailed: 'Не удалось сохранить настройки: {message}',
+      providerCreated: 'Поисковый провайдер создан',
+      providerUpdated: 'Поисковый провайдер обновлён',
+      providerDeleted: 'Поисковый провайдер удалён',
     }
   },
   chatHistorySettings: {
@@ -1340,17 +1381,20 @@ export default {
         embedding: 'Настройте модель встраивания для текстовой векторизации',
         rerank: 'Настройте модель для повторного ранжирования результатов',
         vllm: 'Настройте визуально-языковую модель для мультимодального понимания',
+        asr: 'Настройте модель распознавания речи для транскрибации аудио',
         default: 'Настройте информацию о модели'
       },
       modelNamePlaceholder: {
         local: 'например: llama2:latest',
         remote: 'например: gpt-4, claude-3-opus',
         localVllm: 'например: llava:latest',
-        remoteVllm: 'например: gpt-4-vision-preview'
+        remoteVllm: 'например: gpt-4-vision-preview',
+        remoteAsr: 'например: whisper-1'
       },
       baseUrlLabel: 'Base URL',
       baseUrlPlaceholder: 'например: https://api.openai.com/v1',
       baseUrlPlaceholderVllm: 'например: http://localhost:11434/v1',
+      baseUrlPlaceholderAsr: 'например: https://api.openai.com/v1',
       apiKeyOptional: 'API Key (опционально)',
       apiKeyPlaceholder: 'Введите API Key',
       connectionTest: 'Проверка соединения',
@@ -1599,6 +1643,8 @@ export default {
       advanced: 'Дополнительные настройки',
       faq: 'FAQ настройки',
       graph: 'Граф знаний',
+      multimodal: 'Обработка изображений',
+      asr: 'Обработка аудио',
       storage: 'Storage Engine',
       datasource: 'Источники данных',
       share: 'Sharing'
@@ -1791,6 +1837,19 @@ export default {
       parentChunkSizeDescription: 'Размер родительских блоков для контекста (256-4096)',
       childChunkSizeLabel: 'Размер дочернего блока',
       childChunkSizeDescription: 'Размер дочерних блоков для поиска по эмбеддингам (64-1024)'
+    },
+    multimodal: {
+      title: 'Обработка изображений',
+      description: 'Настройте понимание изображений для парсинга и поиска нетекстового контента',
+    },
+    asr: {
+      title: 'Обработка аудио',
+      description: 'Настройте распознавание речи для загрузки аудиофайлов (mp3, wav, m4a, flac, ogg) и автоматической транскрибации в текст',
+      label: 'Включить распознавание речи',
+      desc: 'При включении аудиофайлы могут быть загружены в базу знаний и автоматически транскрибированы в текст',
+      modelLabel: 'Модель ASR',
+      modelDescription: 'Модель распознавания речи для транскрибации аудио (например, OpenAI Whisper)',
+      modelPlaceholder: 'Выберите модель ASR',
     },
     advanced: {
       title: 'Расширенные настройки',
@@ -2334,6 +2393,11 @@ export default {
       desc: 'Визуально-языковые модели для мультимодального понимания',
       empty: 'Нет VLLM моделей'
     },
+    asr: {
+      title: 'ASR модели речи',
+      desc: 'Модели распознавания речи для транскрибации аудио (например, OpenAI Whisper)',
+      empty: 'Нет ASR моделей'
+    },
     toasts: {
       nameRequired: 'Название модели не может быть пустым',
       nameTooLong: 'Название модели не может превышать 100 символов',
@@ -2618,6 +2682,8 @@ export default {
     unsupportedHint: 'Скачайте файл и откройте локально',
     fullscreen: 'Полноэкранный режим',
     exitFullscreen: 'Выйти из полноэкранного режима',
+    audioLoading: 'Загрузка аудио…',
+    audioNotSupported: 'Ваш браузер не поддерживает воспроизведение аудио',
   },
   knowledgeSearch: {
     title: 'Поиск',
@@ -2703,6 +2769,7 @@ export default {
       fileTypeText: 'Текстовые файлы',
       fileTypeJson: 'Файлы JSON',
       fileTypeImage: 'Изображения',
+      fileTypeAudio: 'Аудиофайлы',
       engines: {
         builtin: {
           name: 'Встроенный',
