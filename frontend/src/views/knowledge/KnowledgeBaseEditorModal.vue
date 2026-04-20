@@ -202,6 +202,50 @@
                   </div>
                 </div>
 
+                <!-- 音视频语音识别（ASR）设置 -->
+                <div v-if="!isFAQ" v-show="currentSection === 'asr'" class="section">
+                  <div v-if="formData" class="kb-multimodal-settings">
+                    <div class="section-header">
+                      <h2>{{ $t('knowledgeEditor.asr.title') }}</h2>
+                      <p class="section-description">{{ $t('knowledgeEditor.asr.description') }}</p>
+                    </div>
+
+                    <div class="settings-group">
+                      <!-- ASR 开关 -->
+                      <div class="setting-row">
+                        <div class="setting-info">
+                          <label>{{ $t('knowledgeEditor.asr.label') }}</label>
+                          <p class="desc">{{ $t('knowledgeEditor.asr.desc') }}</p>
+                        </div>
+                        <div class="setting-control">
+                          <t-switch
+                            v-model="formData.asrConfig.enabled"
+                            size="medium"
+                          />
+                        </div>
+                      </div>
+
+                      <!-- ASR 模型选择 -->
+                      <div v-if="formData.asrConfig.enabled" class="setting-row">
+                        <div class="setting-info">
+                          <label>{{ $t('knowledgeEditor.asr.modelLabel') }} <span class="required">*</span></label>
+                          <p class="desc">{{ $t('knowledgeEditor.asr.modelDescription') }}</p>
+                        </div>
+                        <div class="setting-control">
+                          <ModelSelector
+                            model-type="ASR"
+                            :selected-model-id="formData.asrConfig.modelId"
+                            :all-models="allModels"
+                            @update:selected-model-id="(val: string) => { if (formData) formData.asrConfig.modelId = val }"
+                            @add-model="handleAddASRModel"
+                            :placeholder="$t('knowledgeEditor.asr.modelPlaceholder')"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
                 <!-- 高级设置 -->
                 <div v-if="!isFAQ" v-show="currentSection === 'advanced'" class="section">
                   <KBAdvancedSettings
@@ -248,6 +292,7 @@ import { createKnowledgeBase, getKnowledgeBaseById, listKnowledgeFiles, updateKn
 import { updateKBConfig, type KBModelConfigRequest } from '@/api/initialization'
 import { listModels } from '@/api/model'
 import { useUIStore } from '@/stores/ui'
+import { useAuthStore } from '@/stores/auth'
 import KBModelConfig from './settings/KBModelConfig.vue'
 import KBParserSettings from './settings/KBParserSettings.vue'
 import KBStorageSettings from './settings/KBStorageSettings.vue'
@@ -260,6 +305,7 @@ import DataSourceSettings from './settings/DataSourceSettings.vue'
 import { useI18n } from 'vue-i18n'
 
 const uiStore = useUIStore()
+const authStore = useAuthStore()
 const { t } = useI18n()
 
 // Props
@@ -294,17 +340,18 @@ const navItems = computed(() => {
   } else {
     items.push(
       { key: 'parser', icon: 'file-search', label: t('settings.parserEngine') },
+      { key: 'multimodal', icon: 'image', label: t('knowledgeEditor.sidebar.multimodal') },
+      { key: 'asr', icon: 'sound', label: t('knowledgeEditor.sidebar.asr') },
       { key: 'storage', icon: 'cloud', label: t('knowledgeEditor.sidebar.storage') },
       { key: 'chunking', icon: 'file-copy', label: t('knowledgeEditor.sidebar.chunking') },
       { key: 'graph', icon: 'chart-bubble', label: t('knowledgeEditor.sidebar.graph') },
-      { key: 'multimodal', icon: 'image', label: t('knowledgeEditor.sidebar.multimodal') },
       { key: 'advanced', icon: 'setting', label: t('knowledgeEditor.sidebar.advanced') }
     )
     if (props.mode === 'edit' && props.kbId) {
       items.push({ key: 'datasource', icon: 'cloud-download', label: t('knowledgeEditor.sidebar.datasource'), badge: dsCount.value || undefined })
     }
   }
-  if (props.mode === 'edit' && props.kbId) {
+  if (props.mode === 'edit' && props.kbId && !authStore.isLiteMode) {
     items.push({ key: 'share', icon: 'share', label: t('knowledgeEditor.sidebar.share') })
   }
   return items
@@ -362,6 +409,11 @@ const initFormData = (type: 'document' | 'faq' = 'document') => {
     multimodalConfig: {
       enabled: false,
       vllmModelId: ''
+    },
+    asrConfig: {
+      enabled: false,
+      modelId: '',
+      language: ''
     },
     nodeExtractConfig: {
       enabled: false,
@@ -438,10 +490,15 @@ const loadKBData = async () => {
         parentChunkSize: kb.chunking_config?.parent_chunk_size || 4096,
         childChunkSize: kb.chunking_config?.child_chunk_size || 384
       },
-      storageProvider: (kb.storage_config?.provider || 'local') as string,
+      storageProvider: (kb.storage_provider_config?.provider || kb.storage_config?.provider || 'local') as string,
       multimodalConfig: {
         enabled: !!kb.vlm_config?.enabled,
         vllmModelId: kb.vlm_config?.model_id || ''
+      },
+      asrConfig: {
+        enabled: !!kb.asr_config?.enabled,
+        modelId: kb.asr_config?.model_id || '',
+        language: kb.asr_config?.language || ''
       },
       nodeExtractConfig: {
         enabled: kb.extract_config?.enabled || false,
@@ -501,6 +558,10 @@ const handleMultimodalVLLMChange = (modelId: string) => {
 
 const handleAddVLLMModel = () => {
   uiStore.openSettings('models', 'vllm')
+}
+
+const handleAddASRModel = () => {
+  uiStore.openSettings('models', 'asr')
 }
 
 const handleStorageProviderUpdate = (value: string) => {
@@ -593,7 +654,20 @@ const buildSubmitData = () => {
       : ''
   }
 
+  // 添加ASR语音识别配置
+  data.asr_config = {
+    enabled: formData.value.asrConfig?.enabled || false,
+    model_id: formData.value.asrConfig?.enabled
+      ? (formData.value.asrConfig?.modelId || '')
+      : '',
+    language: formData.value.asrConfig?.language || ''
+  }
+
   // 存储引擎：仅传 provider，参数从全局设置读取
+  // Write to storage_provider_config (authoritative) + storage_config (legacy dual-write)
+  data.storage_provider_config = {
+    provider: formData.value.storageProvider || 'local'
+  }
   data.storage_config = {
     provider: formData.value.storageProvider || 'local'
   }
@@ -701,6 +775,7 @@ const doSubmit = async () => {
         llmModelId: data.summary_model_id,
         embeddingModelId: data.embedding_model_id,
         vlm_config: data.vlm_config,
+        asr_config: data.asr_config,
         documentSplitting: {
           chunkSize: data.chunking_config.chunk_size,
           chunkOverlap: data.chunking_config.chunk_overlap,
@@ -713,7 +788,7 @@ const doSubmit = async () => {
         multimodal: {
           enabled: !!data.vlm_config?.enabled
         },
-        storageProvider: data.storage_config?.provider || 'local',
+        storageProvider: data.storage_provider_config?.provider || data.storage_config?.provider || 'local',
         nodeExtract: {
           enabled: data.extract_config?.enabled || false,
           text: data.extract_config?.text || '',

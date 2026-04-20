@@ -91,6 +91,8 @@ type CustomAgentConfig struct {
 	// ===== Agent Mode Settings =====
 	// Maximum iterations for ReAct loop (only for agent type)
 	MaxIterations int `yaml:"max_iterations" json:"max_iterations"`
+	// Timeout for a single LLM call in seconds (0 = use global default)
+	LLMCallTimeout int `yaml:"llm_call_timeout" json:"llm_call_timeout,omitempty"`
 	// Allowed tools (only for agent type)
 	AllowedTools []string `yaml:"allowed_tools" json:"allowed_tools"`
 	// MCP service selection mode: "all" = all enabled MCP services, "selected" = specific services, "none" = no MCP
@@ -118,6 +120,10 @@ type CustomAgentConfig struct {
 	ImageUploadEnabled bool `yaml:"image_upload_enabled" json:"image_upload_enabled"`
 	// VLM model ID for image analysis (optional, falls back to tenant-level VLM)
 	VLMModelID string `yaml:"vlm_model_id" json:"vlm_model_id"`
+	// Whether audio upload (ASR transcription) is enabled for this agent (default: false)
+	AudioUploadEnabled bool `yaml:"audio_upload_enabled" json:"audio_upload_enabled"`
+	// ASR model ID for audio transcription (optional)
+	ASRModelID string `yaml:"asr_model_id" json:"asr_model_id"`
 	// Storage provider for image uploads: "local", "minio", "cos", "tos"
 	// Empty means use the global/tenant default provider.
 	ImageStorageProvider string `yaml:"image_storage_provider" json:"image_storage_provider"`
@@ -141,6 +147,13 @@ type CustomAgentConfig struct {
 	WebSearchEnabled bool `yaml:"web_search_enabled" json:"web_search_enabled"`
 	// Maximum web search results
 	WebSearchMaxResults int `yaml:"web_search_max_results" json:"web_search_max_results"`
+	// WebSearchProviderID references a specific WebSearchProviderEntity.
+	// If empty, the tenant's default provider (is_default=true) is used.
+	WebSearchProviderID string `yaml:"web_search_provider_id" json:"web_search_provider_id,omitempty"`
+	// Whether to auto-fetch full page content for reranked web search results
+	WebFetchEnabled bool `yaml:"web_fetch_enabled" json:"web_fetch_enabled"`
+	// Max number of pages to fetch after rerank (default: 3)
+	WebFetchTopN int `yaml:"web_fetch_top_n" json:"web_fetch_top_n,omitempty"`
 
 	// ===== Multi-turn Conversation Settings =====
 	// Whether multi-turn conversation is enabled

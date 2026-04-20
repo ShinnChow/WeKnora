@@ -1,5 +1,7 @@
 package types
 
+import "maps"
+
 // PipelineRequest holds immutable configuration set once at the request entry point.
 type PipelineRequest struct {
 	SessionID    string `json:"session_id"`
@@ -45,10 +47,17 @@ type PipelineRequest struct {
 	VLMModelID              string   `json:"-"`
 	ChatModelSupportsVision bool     `json:"-"`
 
+	// File attachments support
+	Attachments MessageAttachments `json:"-"`
+
 	// Misc request-scoped config
-	TenantID         uint64 `json:"-"`
-	WebSearchEnabled bool   `json:"-"`
-	Language         string `json:"-"`
+	TenantID            uint64 `json:"-"`
+	WebSearchEnabled    bool   `json:"-"`
+	WebSearchProviderID string `json:"-"` // Resolved from agent config or tenant default
+	WebSearchMaxResults int    `json:"-"` // Resolved from agent config or tenant default
+	WebFetchEnabled     bool   `json:"-"` // Auto-fetch full page content for web search results after rerank
+	WebFetchTopN        int    `json:"-"` // Max pages to fetch (default 3)
+	Language            string `json:"-"`
 }
 
 // QueryIntent represents the classified intent of a user query.
@@ -61,6 +70,7 @@ const (
 	IntentChitchat      QueryIntent = "chitchat"
 	IntentFollowUp      QueryIntent = "follow_up"
 	IntentImageOnly     QueryIntent = "image_only"
+	IntentDocOnly       QueryIntent = "doc_only"
 	IntentSummarize     QueryIntent = "summarize"
 	IntentClarification QueryIntent = "clarification"
 )
@@ -96,6 +106,7 @@ type PipelineState struct {
 	RenderedContexts     string            `json:"-"`
 	ChatResponse         *ChatResponse     `json:"-"`
 	ImageDescription     string            `json:"-"`
+	QuotedContext        string            `json:"-"` // Quoted message text, injected at LLM prompt stage
 	SystemPromptOverride string            `json:"-"`
 }
 
@@ -149,6 +160,16 @@ func (c *ChatManage) Clone() *ChatManage {
 		}
 	}
 
+	// Deep copy Entity using in search entity plugin
+	entity := make([]string, len(c.Entity))
+	copy(entity, c.Entity)
+
+	entityKBIDs := make([]string, len(c.EntityKBIDs))
+	copy(entityKBIDs, c.EntityKBIDs)
+
+	entityKnowledge := make(map[string]string)
+	maps.Copy(entityKnowledge, c.EntityKnowledge)
+
 	return &ChatManage{
 		PipelineRequest: PipelineRequest{
 			Query:                    c.Query,
@@ -181,16 +202,25 @@ func (c *ChatManage) Clone() *ChatManage {
 			Images:                   append([]string(nil), c.Images...),
 			VLMModelID:               c.VLMModelID,
 			ChatModelSupportsVision:  c.ChatModelSupportsVision,
+			Attachments:              append(MessageAttachments(nil), c.Attachments...),
 			TenantID:                 c.TenantID,
 			WebSearchEnabled:         c.WebSearchEnabled,
+			WebSearchProviderID:      c.WebSearchProviderID,
+			WebSearchMaxResults:      c.WebSearchMaxResults,
+			WebFetchEnabled:          c.WebFetchEnabled,
+			WebFetchTopN:             c.WebFetchTopN,
 			Language:                 c.Language,
 		},
 		PipelineState: PipelineState{
 			RewriteQuery:         c.RewriteQuery,
 			Intent:               c.Intent,
 			ImageDescription:     c.ImageDescription,
+			QuotedContext:        c.QuotedContext,
 			SystemPromptOverride: c.SystemPromptOverride,
 			RenderedContexts:     c.RenderedContexts,
+			Entity:               entity,
+			EntityKBIDs:          entityKBIDs,
+			EntityKnowledge:      entityKnowledge,
 		},
 	}
 }
@@ -205,6 +235,7 @@ const (
 	CHUNK_SEARCH_PARALLEL  EventType = "chunk_search_parallel"
 	ENTITY_SEARCH          EventType = "entity_search"
 	CHUNK_RERANK           EventType = "chunk_rerank"
+	WEB_FETCH              EventType = "web_fetch"
 	CHUNK_MERGE            EventType = "chunk_merge"
 	DATA_ANALYSIS          EventType = "data_analysis"
 	INTO_CHAT_MESSAGE      EventType = "into_chat_message"

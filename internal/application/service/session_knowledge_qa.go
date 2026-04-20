@@ -114,15 +114,21 @@ func (s *sessionService) KnowledgeQA(
 			RewritePromptSystem:     s.cfg.Conversation.RewritePromptSystem,
 			RewritePromptUser:       s.cfg.Conversation.RewritePromptUser,
 			WebSearchEnabled:        req.WebSearchEnabled,
+			WebSearchProviderID:     s.resolveWebSearchProviderID(ctx, req, retrievalTenantID),
+			WebSearchMaxResults:     s.resolveWebSearchMaxResults(ctx, req),
+			WebFetchEnabled:         s.resolveWebFetchEnabled(req),
+			WebFetchTopN:            s.resolveWebFetchTopN(req),
 			TenantID:                retrievalTenantID,
 			Images:                  req.ImageURLs,
 			VLMModelID:              vlmModelID,
 			ChatModelSupportsVision: chatModelSupportsVision,
+			Attachments:             req.Attachments,
 			Language:                types.LanguageNameFromContext(ctx),
 		},
 		PipelineState: types.PipelineState{
 			RewriteQuery:     req.Query,
 			ImageDescription: req.ImageDescription,
+			QuotedContext:    req.QuotedContext,
 		},
 		PipelineContext: types.PipelineContext{
 			EventBus:      eventBus.AsEventBusInterface(),
@@ -147,6 +153,13 @@ func (s *sessionService) KnowledgeQA(
 		if req.ImageDescription != "" && !chatModelSupportsVision {
 			userContent += "\n\n[用户上传图片内容]\n" + req.ImageDescription
 		}
+		if req.QuotedContext != "" {
+			userContent += "\n\n" + req.QuotedContext
+		}
+		// Inject attachment content for pure-chat path (RAG path handles this in INTO_CHAT_MESSAGE).
+		if len(req.Attachments) > 0 {
+			userContent += req.Attachments.BuildPrompt()
+		}
 		chatManage.UserContent = userContent
 
 		pipeline = types.NewPipelineBuilder().
@@ -162,6 +175,7 @@ func (s *sessionService) KnowledgeQA(
 			Add(types.QUERY_UNDERSTAND).
 			Add(types.CHUNK_SEARCH_PARALLEL).
 			Add(types.CHUNK_RERANK).
+			AddIf(req.WebSearchEnabled, types.WEB_FETCH).
 			Add(types.CHUNK_MERGE).
 			Add(types.FILTER_TOP_K).
 			Add(types.DATA_ANALYSIS).
@@ -728,6 +742,9 @@ func (s *sessionService) renderFallbackPrompt(ctx context.Context, chatManage *t
 	if chatManage.ImageDescription != "" && !chatManage.ChatModelSupportsVision {
 		result += "\n\n[用户上传图片内容]\n" + chatManage.ImageDescription
 	}
+	if chatManage.QuotedContext != "" {
+		result += "\n\n" + chatManage.QuotedContext
+	}
 	return result, nil
 }
 
@@ -797,4 +814,49 @@ func (s *sessionService) emitFallbackAnswer(ctx context.Context, chatManage *typ
 	} else {
 		logger.Infof(ctx, "Fallback answer event emitted successfully")
 	}
+}
+
+// resolveWebSearchProviderID returns the web search provider ID to use for a pipeline request.
+// Priority: agent config > tenant default (is_default=true)
+func (s *sessionService) resolveWebSearchProviderID(ctx context.Context, req *types.QARequest, tenantID uint64) string {
+	// 1. Agent-level override
+	if req.CustomAgent != nil && req.CustomAgent.Config.WebSearchProviderID != "" {
+		return req.CustomAgent.Config.WebSearchProviderID
+	}
+	// 2. Tenant default
+	if s.webSearchProviderRepo != nil {
+		if defaultProvider, err := s.webSearchProviderRepo.GetDefault(ctx, tenantID); err == nil && defaultProvider != nil {
+			return defaultProvider.ID
+		}
+	}
+	return ""
+}
+
+// resolveWebFetchEnabled returns whether auto web fetch is enabled for this request.
+func (s *sessionService) resolveWebFetchEnabled(req *types.QARequest) bool {
+	if req.CustomAgent != nil {
+		return req.CustomAgent.Config.WebFetchEnabled
+	}
+	return false
+}
+
+// resolveWebFetchTopN returns how many pages to fetch after rerank.
+func (s *sessionService) resolveWebFetchTopN(req *types.QARequest) int {
+	if req.CustomAgent != nil && req.CustomAgent.Config.WebFetchTopN > 0 {
+		return req.CustomAgent.Config.WebFetchTopN
+	}
+	return 3
+}
+
+// resolveWebSearchMaxResults returns the max results for web search.
+// Priority: agent config > tenant default > default (10)
+func (s *sessionService) resolveWebSearchMaxResults(ctx context.Context, req *types.QARequest) int {
+	if req.CustomAgent != nil && req.CustomAgent.Config.WebSearchMaxResults > 0 {
+		return req.CustomAgent.Config.WebSearchMaxResults
+	}
+	tenantInfo, _ := types.TenantInfoFromContext(ctx)
+	if tenantInfo != nil && tenantInfo.WebSearchConfig != nil && tenantInfo.WebSearchConfig.MaxResults > 0 {
+		return tenantInfo.WebSearchConfig.MaxResults
+	}
+	return 10
 }
