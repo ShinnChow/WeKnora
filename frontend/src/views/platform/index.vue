@@ -1,7 +1,7 @@
 <template>
     <div class="main" ref="dropzone">
         <Menu></Menu>
-        <RouterView />
+        <RouterView v-if="isRouterAlive" />
         <div class="upload-mask" v-show="ismask">
             <input type="file" style="display: none" ref="uploadInput" accept=".pdf,.docx,.doc,.pptx,.ppt,.txt,.md,.jpg,.jpeg,.png,.csv,.xls,.xlsx" />
             <UploadMask></UploadMask>
@@ -12,7 +12,7 @@
 </template>
 <script setup lang="ts">
 import Menu from '@/components/menu.vue'
-import { ref, onMounted, onUnmounted } from 'vue';
+import { ref, onMounted, onUnmounted, nextTick, provide } from 'vue';
 import { useRoute } from 'vue-router'
 import useKnowledgeBase from '@/hooks/useKnowledgeBase'
 import UploadMask from '@/components/upload-mask.vue'
@@ -26,6 +26,30 @@ const route = useRoute();
 let ismask = ref(false)
 let uploadInput = ref();
 const { t } = useI18n();
+
+const isRouterAlive = ref(true)
+const reloadApp = () => {
+    isRouterAlive.value = false
+    nextTick(() => {
+        isRouterAlive.value = true
+    })
+}
+provide('app:reload', reloadApp)
+
+// 仅在 Wails 桌面端运行时拦截 Cmd/Ctrl+R：
+// 桌面端没有浏览器地址栏，整页重载会白屏，所以用前端软刷新替代。
+// 浏览器（含 Web 版 / 非 Lite 部署）里不拦截，交给浏览器做真正的整页刷新，
+// 否则会出现左侧菜单、全局设置、Pinia store 等不随"刷新"一起重置的问题。
+// @ts-ignore
+const isWailsDesktop = typeof window !== 'undefined' && !!(window as any).runtime?.EventsOn
+
+const handleGlobalKeyDown = (e: KeyboardEvent) => {
+    if (!isWailsDesktop) return
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'r') {
+        e.preventDefault()
+        reloadApp()
+    }
+}
 
 // 用于跟踪拖拽进入/离开的计数器，解决子元素触发 dragleave 的问题
 let dragCounter = 0;
@@ -48,7 +72,13 @@ const checkKnowledgeBaseInitialization = async (): Promise<boolean> => {
         const kbResponse = await getKnowledgeBaseById(currentKbId);
         const kb = kbResponse.data;
         
-        if (!kb.embedding_model_id || !kb.summary_model_id) {
+        if (!kb.summary_model_id) {
+            MessagePlugin.warning(t('knowledgeBase.notInitialized'));
+            return false;
+        }
+        const strategy = kb.indexing_strategy;
+        const needsEmbedding = !strategy || strategy.vector_enabled || strategy.keyword_enabled;
+        if (needsEmbedding && !kb.embedding_model_id) {
             MessagePlugin.warning(t('knowledgeBase.notInitialized'));
             return false;
         }
@@ -118,6 +148,13 @@ onMounted(() => {
     document.addEventListener('dragover', handleGlobalDragOver, true);
     document.addEventListener('dragleave', handleGlobalDragLeave, true);
     document.addEventListener('drop', handleGlobalDrop, true);
+    if (isWailsDesktop) {
+        window.addEventListener('keydown', handleGlobalKeyDown);
+        // @ts-ignore
+        window.runtime.EventsOn('app:reload', () => {
+            reloadApp()
+        })
+    }
 });
 
 // 组件卸载时移除全局事件监听器
@@ -126,6 +163,14 @@ onUnmounted(() => {
     document.removeEventListener('dragover', handleGlobalDragOver, true);
     document.removeEventListener('dragleave', handleGlobalDragLeave, true);
     document.removeEventListener('drop', handleGlobalDrop, true);
+    if (isWailsDesktop) {
+        window.removeEventListener('keydown', handleGlobalKeyDown);
+        // @ts-ignore
+        if (window.runtime?.EventsOff) {
+            // @ts-ignore
+            window.runtime.EventsOff('app:reload')
+        }
+    }
     dragCounter = 0;
 });
 </script>

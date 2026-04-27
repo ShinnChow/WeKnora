@@ -1,10 +1,34 @@
 <template>
-    <div class="chat">
+    <div class="chat" :class="{ 'is-embedded': embeddedMode, 'is-sidebar-collapsed': uiStore.sidebarCollapsed }">
         <div ref="scrollContainer" class="chat_scroll_box" @scroll="handleScroll">
-            <div class="msg_list">
+            <div class="msg_list" :class="{ 'is-embedded': embeddedMode }">
+                <!-- 消息列表骨架屏 -->
+                <div v-if="historyLoading && messagesList.length === 0" class="msg-skeleton-list">
+                    <div class="msg-skeleton msg-skeleton-user">
+                        <t-skeleton animation="gradient" :row-col="[{ width: '45%', height: '36px', type: 'rect' }]" />
+                    </div>
+                    <div class="msg-skeleton msg-skeleton-bot">
+                        <t-skeleton animation="gradient" :row-col="[{ width: '80%', height: '16px' }, { width: '100%', height: '16px' }, { width: '60%', height: '16px' }]" />
+                    </div>
+                    <div class="msg-skeleton msg-skeleton-user">
+                        <t-skeleton animation="gradient" :row-col="[{ width: '35%', height: '36px', type: 'rect' }]" />
+                    </div>
+                    <div class="msg-skeleton msg-skeleton-bot">
+                        <t-skeleton animation="gradient" :row-col="[{ width: '70%', height: '16px' }, { width: '90%', height: '16px' }]" />
+                    </div>
+                </div>
                 <!-- 推荐问题卡片 - 仅在新会话（无消息）时展示 -->
-                <div v-if="messagesList.length === 0 && !loading" class="suggested-questions-container" :class="{ 'has-questions': suggestedQuestions.length > 0 }">
-                    <transition name="sq-fade">
+                <div v-if="messagesList.length === 0 && !loading" class="suggested-questions-container" :class="{ 'has-questions': suggestedQuestions.length > 0 || suggestedQuestionsLoading }">
+                    <!-- 骨架屏占位 -->
+                    <div v-if="suggestedQuestionsLoading && suggestedQuestions.length === 0" class="suggested-questions-inner">
+                        <div class="suggested-questions-title"><t-skeleton animation="gradient" :row-col="[{ width: '120px', height: '18px' }]" /></div>
+                        <div class="suggested-questions-grid">
+                            <div v-for="n in 6" :key="'sq-skel-'+n" class="suggested-question-card sq-card-skeleton">
+                                <t-skeleton animation="gradient" :row-col="[{ width: '90%', height: '14px' }, { width: '60%', height: '14px' }]" />
+                            </div>
+                        </div>
+                    </div>
+                    <transition v-else appear name="sq-fade">
                         <div v-if="suggestedQuestions.length > 0" class="suggested-questions-inner">
                             <div class="suggested-questions-title">{{ t('chat.suggestedQuestions') }}</div>
                             <div class="suggested-questions-grid">
@@ -23,11 +47,11 @@
                 </div>
                 <div v-for="(session, id) in messagesList" :key='id'>
                     <div v-if="session.role == 'user'">
-                        <usermsg :content="session.content" :mentioned_items="session.mentioned_items" :images="session.images"></usermsg>
+                        <usermsg :content="session.content" :mentioned_items="session.mentioned_items" :images="session.images" :attachments="session.attachments" :embeddedMode="embeddedMode"></usermsg>
                     </div>
                     <div v-if="session.role == 'assistant'">
                         <botmsg :content="session.content" :session="session" :user-query="getUserQuery(id)" @scroll-bottom="scrollToBottom"
-                            :isFirstEnter="isFirstEnter"></botmsg>
+                            :isFirstEnter="isFirstEnter" :embeddedMode="embeddedMode"></botmsg>
                     </div>
                 </div>
                 <div v-if="loading"
@@ -40,14 +64,20 @@
                 </div>
             </div>
         </div>
-        <div style="min-height: 115px; margin: 16px auto 4px;width: 100%;max-width: 800px;">
+        <transition name="scroll-btn-fade">
+            <div v-show="userHasScrolledUp" class="scroll-to-bottom-btn" @click="onClickScrollToBottom">
+                <t-icon name="chevron-down" size="20px" />
+            </div>
+        </transition>
+        <div class="input-container" :class="{ 'is-embedded': embeddedMode }">
             <InputField
                 ref="inputFieldRef"
-                @send-msg="(query, modelId, mentionedItems, imageFiles) => sendMsg(query, modelId, mentionedItems, imageFiles)"
+                @send-msg="(query, modelId, mentionedItems, imageFiles, attachmentFiles) => sendMsg(query, modelId, mentionedItems, imageFiles, attachmentFiles)"
                 @stop-generation="handleStopGeneration"
                 :isReplying="isReplying"
                 :sessionId="session_id"
                 :assistantMessageId="currentAssistantMessageId"
+                :embeddedMode="embeddedMode"
             ></InputField>
         </div>
     </div>
@@ -62,7 +92,7 @@
 </template>
 <script setup>
 import { storeToRefs } from 'pinia';
-import { ref, onMounted, onUnmounted, nextTick, watch, reactive, onBeforeUnmount } from 'vue';
+import { ref, onMounted, onUnmounted, nextTick, watch, reactive, onBeforeUnmount, defineProps } from 'vue';
 import { useRoute, useRouter, onBeforeRouteLeave, onBeforeRouteUpdate } from 'vue-router';
 import InputField from '../../components/Input-field.vue';
 import botmsg from './components/botmsg.vue';
@@ -77,16 +107,24 @@ import { useI18n } from 'vue-i18n';
 import { useUIStore } from '@/stores/ui';
 import KnowledgeBaseEditorModal from '@/views/knowledge/KnowledgeBaseEditorModal.vue';
 import { useKnowledgeBaseCreationNavigation } from '@/hooks/useKnowledgeBaseCreationNavigation';
+
+const props = defineProps({
+  session_id: { type: String, default: '' },
+  agentId: { type: String, default: '' },
+  kbIds: { type: Array, default: () => [] },
+  embeddedMode: { type: Boolean, default: false }
+});
+
 const usemenuStore = useMenuStore();
 const useSettingsStoreInstance = useSettingsStore();
 const uiStore = useUIStore();
 const { navigateToKnowledgeBaseList } = useKnowledgeBaseCreationNavigation();
 const { t } = useI18n();
-const { menuArr, isFirstSession, firstQuery, firstMentionedItems, firstModelId, firstImageFiles } = storeToRefs(usemenuStore);
+const { menuArr, isFirstSession, firstQuery, firstMentionedItems, firstModelId, firstImageFiles, firstAttachmentFiles } = storeToRefs(usemenuStore);
 const { output, onChunk, isStreaming, isLoading, error, startStream, stopStream } = useStream();
 const route = useRoute();
 const router = useRouter();
-const session_id = ref(route.params.chatid);
+const session_id = ref(props.session_id || route.params.chatid);
 const sessionData = ref(null);
 const inputFieldRef = ref();
 const created_at = ref('');
@@ -98,9 +136,19 @@ const scrollLock = ref(false);
 const isNeedTitle = ref(false);
 const isFirstEnter = ref(true);
 const loading = ref(false);
+const historyLoading = ref(true);
 let fullContent = ref('')
 let userquery = ref('')
 const scrollContainer = ref(null)
+const userHasScrolledUp = ref(false)
+const SCROLL_BOTTOM_THRESHOLD = 80
+
+const isNearBottom = () => {
+    if (!scrollContainer.value) return true;
+    const { scrollTop, scrollHeight, clientHeight } = scrollContainer.value;
+    return scrollHeight - scrollTop - clientHeight < SCROLL_BOTTOM_THRESHOLD;
+}
+
 const handleKBEditorSuccess = (kbId) => {
     navigateToKnowledgeBaseList(kbId)
 }
@@ -116,10 +164,10 @@ const fetchSuggestedQuestions = async () => {
     suggestedQuestionsLoading.value = true;
     // 加载期间保留旧数据，不清空，避免布局抖动
     try {
-        const agentId = useSettingsStoreInstance.selectedAgentId;
+        const agentId = props.embeddedMode ? props.agentId : useSettingsStoreInstance.selectedAgentId;
         if (!agentId) return;
-        const selectedKBs = useSettingsStoreInstance.getSelectedKnowledgeBases();
-        const selectedFiles = useSettingsStoreInstance.getSelectedFiles();
+        const selectedKBs = props.embeddedMode ? props.kbIds : useSettingsStoreInstance.getSelectedKnowledgeBases();
+        const selectedFiles = props.embeddedMode ? [] : useSettingsStoreInstance.getSelectedFiles();
         const res = await getSuggestedQuestions(agentId, {
             knowledge_base_ids: selectedKBs.length > 0 ? selectedKBs : undefined,
             knowledge_ids: selectedFiles.length > 0 ? selectedFiles : undefined,
@@ -198,10 +246,12 @@ watch([() => route.params], (newvalue) => {
         messagesList.splice(0);
         session_id.value = newvalue[0].chatid;
         
-        // 切换会话时，重置状态（加载历史消息不应显示loading）
+        // 切换会话时，重置状态
+        historyLoading.value = true;
         loading.value = false;
         isReplying.value = false;
         currentAssistantMessageId.value = '';
+        userHasScrolledUp.value = false;
         
         checkmenuTitle(session_id.value)
         let data = {
@@ -212,12 +262,17 @@ watch([() => route.params], (newvalue) => {
         getmsgList(data);
     }
 });
-const scrollToBottom = () => {
+const scrollToBottom = (force = false) => {
+    if (!force && userHasScrolledUp.value) return;
     nextTick(() => {
         if (scrollContainer.value) {
             scrollContainer.value.scrollTop = scrollContainer.value.scrollHeight;
         }
     })
+}
+const onClickScrollToBottom = () => {
+    userHasScrolledUp.value = false;
+    scrollToBottom(true);
 }
 const debounce = (fn, delay) => {
     let timer
@@ -239,7 +294,11 @@ const onChatScrollTop = () => {
         getmsgList(data, true, scrollHeight);
     }
 }
-const handleScroll = debounce(onChatScrollTop, 500);
+const debouncedScrollTop = debounce(onChatScrollTop, 500);
+const handleScroll = () => {
+    userHasScrolledUp.value = !isNearBottom();
+    debouncedScrollTop();
+};
 
 const getmsgList = (data, isScrollType = false, scrollHeight) => {
     getMessageList(data).then(res => {
@@ -247,6 +306,8 @@ const getmsgList = (data, isScrollType = false, scrollHeight) => {
             created_at.value = res.data[0].created_at;
             handleMsgList(res.data, isScrollType, scrollHeight);
         }
+    }).finally(() => {
+        historyLoading.value = false;
     })
 }
 
@@ -381,7 +442,7 @@ const handleMsgList = async (data, isScrollType = false, newScrollHeight) => {
         }
         messagesList.unshift(item);
         if (isFirstEnter.value) {
-            scrollToBottom();
+            scrollToBottom(true);
         } else if (isScrollType) {
             nextTick(() => {
                 const { scrollHeight } = scrollContainer.value;
@@ -418,7 +479,7 @@ const handleStopGeneration = () => {
     // API 调用成功后，后端的 stop 事件会清空它
 };
 
-const sendMsg = async (value, modelId = '', mentionedItems = [], imageFiles = []) => {
+const sendMsg = async (value, modelId = '', mentionedItems = [], imageFiles = [], attachmentFiles = []) => {
     userquery.value = value;
     isReplying.value = true;
     loading.value = true;
@@ -441,23 +502,55 @@ const sendMsg = async (value, modelId = '', mentionedItems = [], imageFiles = []
         }
     }
 
+    // Convert attachment files to base64 for backend processing
+    let attachmentUploads = [];
+    if (attachmentFiles && attachmentFiles.length > 0) {
+        try {
+            for (const attachment of attachmentFiles) {
+                const reader = new FileReader();
+                const base64Promise = new Promise((resolve, reject) => {
+                    reader.onload = () => {
+                        const result = reader.result;
+                        // Extract base64 content (remove data:...;base64, prefix)
+                        const base64 = result.split(',')[1];
+                        resolve(base64);
+                    };
+                    reader.onerror = reject;
+                    reader.readAsDataURL(attachment.file);
+                });
+                const base64Data = await base64Promise;
+                attachmentUploads.push({
+                    data: base64Data,
+                    file_name: attachment.name,
+                    file_size: attachment.size
+                });
+            }
+        } catch (e) {
+            console.error('[Attachment] Failed to read attachments:', e);
+            loading.value = false;
+            isReplying.value = false;
+            return;
+        }
+    }
+
     // 将@提及的知识库和文件信息存入用户消息
-    messagesList.push({ content: value, role: 'user', mentioned_items: mentionedItems, images: userImages, channel: 'web' });
-    scrollToBottom();
+     messagesList.push({ content: value, role: 'user', mentioned_items: mentionedItems, images: userImages, attachments: attachmentFiles.map(a => ({ file_name: a.name, file_size: a.size, file_type: '.' + a.name.split('.').pop()?.toLowerCase() })), channel: 'web' });
+    userHasScrolledUp.value = false;
+    scrollToBottom(true);
     
     // Get agent mode status from settings store
-    const agentEnabled = useSettingsStoreInstance.isAgentEnabled;
+    const agentEnabled = props.embeddedMode ? (props.agentId && props.agentId !== 'builtin-quick-answer') : useSettingsStoreInstance.isAgentEnabled;
     
     // Get web search status from settings store
-    const webSearchEnabled = useSettingsStoreInstance.isWebSearchEnabled;
+    const webSearchEnabled = props.embeddedMode ? false : useSettingsStoreInstance.isWebSearchEnabled;
     
     // Get memory status from settings store
-    const enableMemory = useSettingsStoreInstance.isMemoryEnabled;
+    const enableMemory = props.embeddedMode ? false : useSettingsStoreInstance.isMemoryEnabled;
     
     // Get knowledge_base_ids from settings store (selected by user via KnowledgeBaseSelector)
     // Merge @mentioned KB/file IDs so retrieval uses the same targets user @mentioned (including shared KBs)
-    const sidebarKbIds = useSettingsStoreInstance.settings.selectedKnowledgeBases || [];
-    const sidebarFileIds = useSettingsStoreInstance.settings.selectedFiles || [];
+    const sidebarKbIds = props.embeddedMode ? props.kbIds : (useSettingsStoreInstance.settings.selectedKnowledgeBases || []);
+    const sidebarFileIds = props.embeddedMode ? [] : (useSettingsStoreInstance.settings.selectedFiles || []);
     const kbIdSet = new Set(sidebarKbIds);
     const fileIdSet = new Set(sidebarFileIds);
     for (const item of mentionedItems || []) {
@@ -472,13 +565,13 @@ const sendMsg = async (value, modelId = '', mentionedItems = [], imageFiles = []
     const knowledgeIds = [...fileIdSet];
 
     // Get selected agent ID (backend resolves shared agent and its tenant from share relation)
-    const selectedAgentId = useSettingsStoreInstance.selectedAgentId || '';
+    const selectedAgentId = props.embeddedMode ? props.agentId : (useSettingsStoreInstance.selectedAgentId || '');
 
     // Use agent-chat endpoint when agent is enabled, otherwise use knowledge-chat
     const endpoint = agentEnabled ? '/api/v1/agent-chat' : '/api/v1/knowledge-chat';
     
     // Get selected MCP services from settings store (if available)
-    const mcpServiceIds = useSettingsStoreInstance.settings.selectedMCPServices || [];
+    const mcpServiceIds = props.embeddedMode ? [] : (useSettingsStoreInstance.settings.selectedMCPServices || []);
     
     await startStream({ 
         session_id: session_id.value, 
@@ -492,6 +585,7 @@ const sendMsg = async (value, modelId = '', mentionedItems = [], imageFiles = []
         mcp_service_ids: mcpServiceIds,
         mentioned_items: mentionedItems,
         images: imageAttachments.length > 0 ? imageAttachments : undefined,
+        attachment_uploads: attachmentUploads.length > 0 ? attachmentUploads : undefined,
         query: value, 
         method: 'POST', 
         url: endpoint
@@ -605,7 +699,7 @@ onChunk((data) => {
             };
             messagesList.push(existingMessage);
             loading.value = false; // 消息已创建，关闭 loading
-            scrollToBottom();
+            scrollToBottom(true);
         }
         
         existingMessage.knowledge_references = data.knowledge_references || data.data?.references || [];
@@ -707,7 +801,7 @@ const handleAgentChunk = (data) => {
         };
         messagesList.push(newMsg);
         loading.value = false; // 消息已创建，关闭 loading
-        scrollToBottom();
+        scrollToBottom(true);
         // Don't return - continue to process the current event data
         message = newMsg;
     }
@@ -1055,10 +1149,16 @@ onMounted(async () => {
     messagesList.splice(0);
     
     // 若从智能体列表点击共享智能体进入，URL 带 agent_id 与 source_tenant_id，同步到 store
-    const agentIdFromQuery = route.query.agent_id && String(route.query.agent_id);
+    const agentIdFromQuery = props.embeddedAgentId || (route.query.agent_id && String(route.query.agent_id));
     const sourceTenantIdFromQuery = route.query.source_tenant_id && String(route.query.source_tenant_id);
     if (agentIdFromQuery && sourceTenantIdFromQuery) {
         useSettingsStoreInstance.selectAgent(agentIdFromQuery, sourceTenantIdFromQuery);
+    } else if (agentIdFromQuery) {
+        useSettingsStoreInstance.selectAgent(agentIdFromQuery, null);
+    }
+    
+    if (props.embeddedKbIds && props.embeddedKbIds.length > 0) {
+        useSettingsStoreInstance.selectKnowledgeBases(props.embeddedKbIds);
     }
     
     // 初始化状态：加载历史消息时不应显示loading
@@ -1078,8 +1178,9 @@ onMounted(async () => {
     checkmenuTitle(session_id.value)
     if (firstQuery.value) {
         scrollLock.value = true;
-        sendMsg(firstQuery.value, firstModelId.value || '', firstMentionedItems.value || [], firstImageFiles.value || []);
-        usemenuStore.changeFirstQuery('', [], '', []);
+        historyLoading.value = false;
+         sendMsg(firstQuery.value, firstModelId.value || '', firstMentionedItems.value || [], firstImageFiles.value || [], firstAttachmentFiles.value || []);
+        usemenuStore.changeFirstQuery('', [], '', [], []);
     } else {
         scrollLock.value = false;
         let data = {
@@ -1125,6 +1226,25 @@ onBeforeRouteUpdate((to, from, next) => {
     max-width: calc(100vw - 260px);
     min-width: 400px;
 
+    &.is-sidebar-collapsed {
+        max-width: calc(100vw - 60px);
+    }
+
+    &.is-embedded {
+        max-width: 100%;
+        min-width: 100%;
+        padding: 0;
+        overflow-x: hidden;
+    }
+
+    &.is-embedded :deep(.answers-input) {
+        transform: translateX(0);
+        width: 100%;
+        left: 0;
+        display: flex;
+        justify-content: center;
+    }
+
     :deep(.answers-input) {
         position: static;
         transform: translateX(0);
@@ -1147,6 +1267,45 @@ onBeforeRouteUpdate((to, from, next) => {
     }
 }
 
+.scroll-to-bottom-btn {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    bottom: 140px;
+    z-index: 10;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: var(--td-bg-color-container);
+    border: 1px solid var(--td-component-stroke);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    color: var(--td-text-color-secondary);
+    transition: all 0.2s ease;
+
+    &:hover {
+        background: var(--td-bg-color-container-hover);
+        color: var(--td-text-color-primary);
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    }
+
+    &:active {
+        transform: translateX(-50%) scale(0.92);
+    }
+}
+
+.scroll-btn-fade-enter-active,
+.scroll-btn-fade-leave-active {
+    transition: opacity 0.2s ease, transform 0.2s ease;
+}
+.scroll-btn-fade-enter-from,
+.scroll-btn-fade-leave-to {
+    opacity: 0;
+    transform: translateX(-50%) translateY(8px);
+}
 
 .agent-mode-indicator {
     display: flex;
@@ -1169,6 +1328,45 @@ onBeforeRouteUpdate((to, from, next) => {
         font-weight: 500;
         color: var(--td-brand-color);
         flex: 1;
+    }
+}
+
+@keyframes contentFadeIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.msg-skeleton-list {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    max-width: 800px;
+    padding: 16px 0;
+    animation: contentFadeIn 0.3s ease-out;
+}
+.msg-skeleton-user {
+    display: flex;
+    justify-content: flex-end;
+}
+.msg-skeleton-bot {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding-left: 4px;
+}
+
+.input-container {
+    min-height: 115px;
+    margin: 16px auto 4px;
+    width: 100%;
+    max-width: 800px;
+    box-sizing: border-box;
+
+    &.is-embedded {
+        max-width: 100%;
+        width: 100%;
+        margin: 0;
+        overflow-x: hidden;
     }
 }
 
@@ -1244,6 +1442,7 @@ onBeforeRouteUpdate((to, from, next) => {
     flex-direction: column;
     align-items: center;
     width: 100%;
+    animation: contentFadeIn 0.3s ease-out;
 }
 
 .sq-fade-enter-active,

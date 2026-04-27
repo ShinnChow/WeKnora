@@ -5,7 +5,10 @@ import { previewKnowledgeFile } from '@/api/knowledge-base/index';
 import { MessagePlugin } from 'tdesign-vue-next';
 import hljs from 'highlight.js';
 import 'highlight.js/styles/github.css';
+import markedKatex from 'marked-katex-extension';
+import 'katex/dist/katex.min.css';
 import { useI18n } from 'vue-i18n';
+import { sanitizeHTML, safeMarkdownToHTML } from '@/utils/security';
 
 
 const VueOfficePptx = defineAsyncComponent(() => import('@vue-office/pptx'));
@@ -21,7 +24,7 @@ const props = defineProps<{
 
 const loading = ref(false);
 const error = ref('');
-const previewType = ref<'pdf' | 'docx' | 'image' | 'excel' | 'text' | 'markdown' | 'pptx' | 'unsupported'>('unsupported');
+const previewType = ref<'pdf' | 'docx' | 'image' | 'excel' | 'text' | 'markdown' | 'pptx' | 'audio' | 'unsupported'>('unsupported');
 const blobUrl = ref('');
 const textContent = ref('');
 const highlightedCode = ref('');
@@ -55,6 +58,7 @@ const fileTypeMap: Record<string, typeof previewType.value> = {};
 ['txt', 'json', 'xml', 'html', 'css', 'js', 'ts', 'py', 'java', 'go',
  'cpp', 'c', 'h', 'sh', 'yaml', 'yml', 'ini', 'conf', 'log', 'sql', 'rs', 'rb', 'php',
  'swift', 'kt', 'scala', 'r', 'lua', 'pl', 'toml'].forEach(t => fileTypeMap[t] = 'text');
+['mp3', 'wav', 'm4a', 'flac', 'ogg'].forEach(t => fileTypeMap[t] = 'audio');
 
 const mimeTypeMap: Record<string, string> = {
   pdf: 'application/pdf',
@@ -73,6 +77,8 @@ const mimeTypeMap: Record<string, string> = {
   html: 'text/html', css: 'text/css',
   js: 'text/javascript', ts: 'text/typescript',
   py: 'text/x-python', java: 'text/x-java', go: 'text/x-go',
+  mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4',
+  flac: 'audio/flac', ogg: 'audio/ogg',
 };
 
 function getMimeType(ft: string): string {
@@ -99,6 +105,15 @@ function getHighlightLang(ft: string): string {
   const lower = ft?.toLowerCase() || '';
   return langMap[lower] || lower;
 }
+
+const preprocessMathDelimiters = (rawText: string): string => {
+  if (!rawText || typeof rawText !== 'string') {
+    return '';
+  }
+  return rawText
+    .replace(/\\\[([\s\S]*?)\\\]/g, '$$$$$1$$$$')
+    .replace(/\\\(([\s\S]*?)\\\)/g, '$$$1$$');
+};
 
 async function renderDocx(blob: Blob) {
   const { renderAsync } = await import('docx-preview');
@@ -171,7 +186,7 @@ async function renderExcel(blob: Blob, fileType?: string) {
     html += sheetHtml;
     html += `</div>`;
   });
-  excelHtml.value = html;
+  excelHtml.value = sanitizeHTML(html);
 }
 
 async function renderText(blob: Blob, fileType: string) {
@@ -192,12 +207,25 @@ async function renderText(blob: Blob, fileType: string) {
 async function renderMarkdown(blob: Blob) {
   const { marked } = await import('marked');
   const text = await blob.text();
+
+  // 校验文本内容是否有效
+  if (!text || typeof text !== 'string') {
+    markdownHtml.value = '<p style="color: var(--td-text-color-disabled); text-align: center; padding: 20px;">文档内容为空</p>';
+    return;
+  }
+
   marked.use({
     breaks: true,
     gfm: true,
   });
+  marked.use(markedKatex({ throwOnError: false }));
   const renderer = new marked.Renderer();
   renderer.code = function ({text, lang}) {
+    // 空值校验：防止 text 为 undefined 或 null
+    if (!text || typeof text !== 'string') {
+      text = '';
+    }
+
     let highlighted = '';
     if (lang && hljs.getLanguage(lang)) {
       try { highlighted = hljs.highlight(text, { language: lang }).value; }
@@ -208,7 +236,10 @@ async function renderMarkdown(blob: Blob) {
     return `<pre><code class="hljs">${highlighted}</code></pre>`;
   };
   marked.use({ renderer });
-  markdownHtml.value = marked.parse(text);
+  const mathSafeText = preprocessMathDelimiters(text);
+  const safeText = safeMarkdownToHTML(mathSafeText);
+  const rawHtml = marked.parse(safeText) as string;
+  markdownHtml.value = sanitizeHTML(rawHtml);
 }
 
 function onImageLoad(e: Event) {
@@ -268,6 +299,10 @@ async function loadPreview() {
       }
       case 'pptx': {
         pptxData.value = await blob.arrayBuffer();
+        break;
+      }
+      case 'audio': {
+        blobUrl.value = URL.createObjectURL(blob);
         break;
       }
     }
@@ -386,6 +421,17 @@ onUnmounted(() => {
     <!-- Text / Code -->
     <div v-else-if="previewType === 'text' && highlightedCode" class="preview-text">
       <pre class="code-preview"><code class="hljs" v-html="highlightedCode"></code></pre>
+    </div>
+
+    <!-- Audio -->
+    <div v-else-if="previewType === 'audio' && blobUrl" class="preview-audio">
+      <div class="audio-wrapper">
+        <t-icon name="sound" size="48px" />
+        <p class="audio-filename">{{ fileName }}</p>
+        <audio controls :src="blobUrl" class="audio-element">
+          {{ $t('preview.audioNotSupported') }}
+        </audio>
+      </div>
     </div>
   </div>
 </template>
@@ -618,6 +664,22 @@ onUnmounted(() => {
       display: block;
       background: transparent;
     }
+  }
+}
+
+// ── Audio ──
+.preview-audio {
+  display: flex;
+  justify-content: center;
+  padding: 40px 20px;
+  .audio-wrapper {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+    color: @text-secondary;
+    .audio-filename { font-size: 14px; color: @text-primary; margin: 0; }
+    .audio-element { width: 100%; max-width: 480px; }
   }
 }
 

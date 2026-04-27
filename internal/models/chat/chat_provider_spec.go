@@ -2,10 +2,13 @@ package chat
 
 import (
 	"context"
+	"net/http"
 	"strings"
 
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/provider"
+	modelutils "github.com/Tencent/WeKnora/internal/models/utils"
+	"github.com/google/uuid"
 	"github.com/sashabaranov/go-openai"
 )
 
@@ -20,11 +23,22 @@ type ProviderSpec struct {
 	RequestCustomizer func(req *openai.ChatCompletionRequest, opts *ChatOptions, isStream bool) (any, bool)
 	// EndpointCustomizer: provider-specific endpoint URL override.
 	EndpointCustomizer func(baseURL string, modelID string, isStream bool) string
+	// HeaderCustomizer: provider-specific raw HTTP header customization.
+	HeaderCustomizer func(chat *RemoteAPIChat, req *http.Request, body []byte) error
 }
 
 // chatProviderSpecs is the ordered list of provider specs.
 // Order matters: more specific specs (with ModelMatcher) should come before generic ones.
 var chatProviderSpecs = []ProviderSpec{
+	// WeKnoraCloud
+	{
+		Provider:          provider.ProviderWeKnoraCloud,
+		RequestCustomizer: weKnoraCloudRequestCustomizer,
+		EndpointCustomizer: func(baseURL string, _ string, _ bool) string {
+			return strings.TrimRight(baseURL, "/") + "/api/v1/chat/completions"
+		},
+		HeaderCustomizer: weKnoraCloudHeaderCustomizer,
+	},
 	// Aliyun Qwen Thinking Models (must be before generic Aliyun)
 	{
 		Provider:          provider.ProviderAliyun,
@@ -94,6 +108,47 @@ type ThinkingChatCompletionRequest struct {
 }
 
 // --- Customizer functions ---
+
+// weKnoraCloudRequestCustomizer 构造 WeKnoraCloud 请求。
+// WeKnoraCloud 走 OpenAI 兼容格式，除了 MultiContent 需要降级为纯文本 Content 之外，
+// 其他字段（tools / tool_choice / parallel_tool_calls / response_format / stream_options 等）直接透传，
+// 以保证 function calling 等能力可用。
+func weKnoraCloudRequestCustomizer(req *openai.ChatCompletionRequest, _ *ChatOptions, isStream bool) (any, bool) {
+	cloudReq := *req
+	cloudReq.Stream = isStream
+	cloudReq.Messages = convertToWeKnoraCloudMessagesFromOpenAI(req.Messages)
+	return cloudReq, true
+}
+
+func weKnoraCloudHeaderCustomizer(chat *RemoteAPIChat, req *http.Request, body []byte) error {
+	requestID := uuid.NewString()
+	headers := modelutils.Sign(chat.appID, chat.appSecret, requestID, string(body))
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	return nil
+}
+
+// convertToWeKnoraCloudMessagesFromOpenAI 将 MultiContent 降级为纯文本，
+// 其它字段（tool_calls / tool_call_id / name 等）完全保留，保证 tool 协议正常。
+func convertToWeKnoraCloudMessagesFromOpenAI(messages []openai.ChatCompletionMessage) []openai.ChatCompletionMessage {
+	result := make([]openai.ChatCompletionMessage, 0, len(messages))
+	for _, m := range messages {
+		msg := m
+		if msg.Content == "" && len(msg.MultiContent) > 0 {
+			var textParts []string
+			for _, part := range msg.MultiContent {
+				if part.Type == openai.ChatMessagePartTypeText && part.Text != "" {
+					textParts = append(textParts, part.Text)
+				}
+			}
+			msg.Content = strings.Join(textParts, "\n")
+			msg.MultiContent = nil
+		}
+		result = append(result, msg)
+	}
+	return result
+}
 
 // qwenThinkingRequestCustomizer 自定义 Qwen 系列（阿里云）模型的思考请求
 func qwenThinkingRequestCustomizer(

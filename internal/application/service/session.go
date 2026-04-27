@@ -25,20 +25,21 @@ func generateEventID(suffix string) string {
 
 // sessionService implements the SessionService interface for managing conversation sessions
 type sessionService struct {
-	cfg                  *config.Config                   // Application configuration
-	sessionRepo          interfaces.SessionRepository     // Repository for session data
-	messageRepo          interfaces.MessageRepository     // Repository for message data
-	knowledgeBaseService interfaces.KnowledgeBaseService  // Service for knowledge base operations
-	modelService         interfaces.ModelService          // Service for model operations
-	tenantService        interfaces.TenantService         // Service for tenant operations
-	eventManager         *chatpipeline.EventManager        // Event manager for chat pipeline
-	agentService         interfaces.AgentService          // Service for agent operations
-	sessionStorage       llmcontext.ContextStorage        // Session storage
-	knowledgeService     interfaces.KnowledgeService      // Service for knowledge operations
-	chunkService         interfaces.ChunkService          // Service for chunk operations
-	webSearchStateRepo   interfaces.WebSearchStateService // Service for web search state
-	kbShareService       interfaces.KBShareService        // Service for KB sharing operations
-	memoryService        interfaces.MemoryService         // Service for memory operations
+	cfg                   *config.Config                         // Application configuration
+	sessionRepo           interfaces.SessionRepository           // Repository for session data
+	messageRepo           interfaces.MessageRepository           // Repository for message data
+	knowledgeBaseService  interfaces.KnowledgeBaseService        // Service for knowledge base operations
+	modelService          interfaces.ModelService                // Service for model operations
+	tenantService         interfaces.TenantService               // Service for tenant operations
+	eventManager          *chatpipeline.EventManager             // Event manager for chat pipeline
+	agentService          interfaces.AgentService                // Service for agent operations
+	sessionStorage        llmcontext.ContextStorage              // Session storage
+	knowledgeService      interfaces.KnowledgeService            // Service for knowledge operations
+	chunkService          interfaces.ChunkService                // Service for chunk operations
+	webSearchStateRepo    interfaces.WebSearchStateService       // Service for web search state
+	webSearchProviderRepo interfaces.WebSearchProviderRepository // Repository for web search provider entities
+	kbShareService        interfaces.KBShareService              // Service for KB sharing operations
+	memoryService         interfaces.MemoryService               // Service for memory operations
 }
 
 // NewSessionService creates a new session service instance with all required dependencies
@@ -54,24 +55,26 @@ func NewSessionService(cfg *config.Config,
 	agentService interfaces.AgentService,
 	sessionStorage llmcontext.ContextStorage,
 	webSearchStateRepo interfaces.WebSearchStateService,
+	webSearchProviderRepo interfaces.WebSearchProviderRepository,
 	kbShareService interfaces.KBShareService,
 	memoryService interfaces.MemoryService,
 ) interfaces.SessionService {
 	return &sessionService{
-		cfg:                  cfg,
-		sessionRepo:          sessionRepo,
-		messageRepo:          messageRepo,
-		knowledgeBaseService: knowledgeBaseService,
-		knowledgeService:     knowledgeService,
-		chunkService:         chunkService,
-		modelService:         modelService,
-		tenantService:        tenantService,
-		eventManager:         eventManager,
-		agentService:         agentService,
-		sessionStorage:       sessionStorage,
-		webSearchStateRepo:   webSearchStateRepo,
-		kbShareService:       kbShareService,
-		memoryService:        memoryService,
+		cfg:                   cfg,
+		sessionRepo:           sessionRepo,
+		messageRepo:           messageRepo,
+		knowledgeBaseService:  knowledgeBaseService,
+		knowledgeService:      knowledgeService,
+		chunkService:          chunkService,
+		modelService:          modelService,
+		tenantService:         tenantService,
+		eventManager:          eventManager,
+		agentService:          agentService,
+		sessionStorage:        sessionStorage,
+		webSearchStateRepo:    webSearchStateRepo,
+		webSearchProviderRepo: webSearchProviderRepo,
+		kbShareService:        kbShareService,
+		memoryService:         memoryService,
 	}
 }
 
@@ -455,6 +458,9 @@ func (s *sessionService) GenerateTitleAsync(
 	tenantID := ctx.Value(types.TenantIDContextKey)
 	requestID := ctx.Value(types.RequestIDContextKey)
 	language := ctx.Value(types.LanguageContextKey)
+	// Keep the Langfuse trace handle so the async title generation shows up
+	// as a child of the same trace as the originating chat request.
+	langfuseTrace := ctx.Value(types.LangfuseTraceContextKey)
 	go func() {
 		bgCtx := context.Background()
 		if tenantID != nil {
@@ -465,6 +471,9 @@ func (s *sessionService) GenerateTitleAsync(
 		}
 		if language != nil {
 			bgCtx = context.WithValue(bgCtx, types.LanguageContextKey, language)
+		}
+		if langfuseTrace != nil {
+			bgCtx = context.WithValue(bgCtx, types.LangfuseTraceContextKey, langfuseTrace)
 		}
 
 		// Skip if title already exists

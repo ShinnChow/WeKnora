@@ -197,6 +197,7 @@ const getWebSearchDisplayText = (item) => {
     background-color: var(--td-bg-color-container);
     border: .5px solid var(--td-component-stroke);
     box-shadow: 0 2px 4px rgba(7, 192, 95, 0.08);
+    box-sizing: border-box;
     overflow: hidden;
     box-sizing: border-box;
     transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
@@ -259,19 +260,17 @@ const getWebSearchDisplayText = (item) => {
     line-height: 20px;
     padding: 2px 0;
     transition: all 0.2s ease;
-    border-bottom: 1px solid transparent;
+    border-bottom: 1px dashed var(--td-brand-color);
 
     &:hover {
-        border-bottom-color: var(--td-brand-color);
+        background-color: rgba(7, 192, 95, 0.08);
+        border-radius: 3px;
+        padding-right: 4px;
     }
 
     &.doc-web {
         white-space: normal;
         word-break: break-all;
-
-        &:hover {
-            text-decoration: underline;
-        }
     }
 }
 

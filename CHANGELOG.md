@@ -2,6 +2,136 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-04-27
+
+### 🚀 New Features
+- **NEW**: Wiki Mode — a brand-new agent-driven Wiki knowledge system that automatically distills raw documents into interlinked markdown pages. It ships with a dedicated WikiBrowser, an interactive knowledge graph visualizing references and relationships between pages, and specialized agent tools, empowering teams to grow a structured, continuously evolving knowledge base from their own materials.
+- **NEW**: Observability — integrated Langfuse for agent ReAct loop, LLM token tracking, tool calls, and asynq pipeline tracing, providing deep visibility into agent reasoning, tool execution, and system performance.
+- **NEW**: Customizable Indexing Strategy — users can now independently toggle Vector Search, Keyword Search, Wiki, and Knowledge Graph indexing on a per-knowledge-base level.
+- **NEW**: Vector Store UI & Per-KB Binding — full frontend management interface for Vector Stores, allowing users to configure connections, test connectivity, and assign specific vector stores to different knowledge bases.
+- **NEW**: Yuque Connector — Yuque data source integration with API client, full and incremental fetch, and resource mapping, enabling seamless synchronization of Yuque documents into the knowledge base.
+- **NEW**: Built-in Agent Skills — added a preloaded `OpenMAIC Classroom` agent skill.
+- **NEW**: Agent Tools — added `json_repair` tool for agents to automatically fix and parse malformed JSON outputs.
+- **NEW**: Frontend — added copy action for model cards in settings.
+- **NEW**: Agent — added support to load all sheets from Excel files for DuckDB data analysis.
+
+### ⚡ Improvements
+- **IMPROVED**: Agent — improved tenant context handling and error reporting.
+- **IMPROVED**: Agent — updated synthesis and issue flagging instructions in system prompt.
+- **IMPROVED**: Debugging — enhanced LLM request logging and debug output (`llm_debug`) across all model providers.
+
+### 🐛 Bug Fixes
+- **FIXED**: Agent — materialized knowledge files to temp path for DuckDB to fix access issues
+- **FIXED**: Agent — removed rerank model requirement for wiki-only agents
+- **FIXED**: Docreader — whitelisted offline protoc zip packages in dockerignore
+- **FIXED**: System — changed hardcoded version to `*` comparison for new Linux version compatibility
+- **FIXED**: Setup — added output if offline protoc install package already exists
+
+## [0.4.0] - 2026-04-14
+
+### 🚀 New Features
+- **NEW**: Cloud Knowledge Assistant — [WeKnora Platform](https://weknora.weixin.qq.com/platform), a cloud-hosted knowledge assistant service for quick onboarding without local deployment
+- **NEW**: WeKnora Cloud — WeKnora Cloud provider integration, providing hosted LLM models and document parsing capabilities, with credential management, status checks, and UI feedback
+- **NEW**: Chrome Extension — browser extension support with menu entry and quick access integration for seamless knowledge capture from web pages
+- **NEW**: WeChat IM Integration — WeChat channel adapter with QR code login and long-polling message support
+- **NEW**: ClawHub Skill — WeKnora Skill published on ClawHub platform, enabling document import, hybrid search, and knowledge management via the WeKnora REST API
+- **NEW**: Attachment Processing — file attachment support in chat pipeline with enhanced error handling, content formatting, and image/attachment metadata injection in queries
+- **NEW**: Azure OpenAI Provider — full Azure OpenAI support for chat, VLM, and embedding models with deployment name preservation, configurable dimensions parameter, provider registration with metadata, URL auto-detection, and frontend provider integration with i18n
+- **NEW**: Alibaba Cloud OSS Storage — object storage support via S3-compatible mode with configuration UI, connectivity test, status reporting, OSS TypeScript types, docreader OssStorage class, factory and container registration, and multi-language i18n (Korean, Russian)
+- **NEW**: Notion Connector — Notion data source integration with API client, type definitions, Connector interface, markdown renderer, and dependency injection registration
+- **NEW**: Baidu Web Search Provider — added Baidu as a web search provider option (#907)
+- **NEW**: Ollama Web Search Provider — added Ollama as a web search provider option (#907)
+- **NEW**: VectorStore Management — VectorStore entity, repository, database migrations, service layer with connection testing, and full CRUD API endpoints with Swagger documentation
+
+### ⚡ Improvements
+- Data source resource selector upgraded to tree view with parent-child indentation and cascading check/uncheck
+- Customizable LLM call timeout for agents with docker-compose environment mapping
+- Enhanced document summary with expandable/collapsible functionality and overflow detection for improved user interaction
+- Improved chat UI with hover effects, database schema updates for chat history and retrieval configurations
+- Enhanced chat pipeline query handling with image and attachment metadata
+- Support custom endpoints for private WeCom deployments in IM channels
+- Integrated Lumberjack for log file management with rotation and compression
+- New document analysis prompt template and enhanced rewrite template descriptions
+- Integrated ChatBot provider and docreader for unified chat service
+
+### 🐛 Bug Fixes
+- Fixed hardcoded TruncatePromptTokens in BatchEmbed causing unintended embedding truncation
+- Fixed `<kb>` and `<web>` citation tags not being stripped before sending to IM platforms, causing raw tags in user-visible messages
+- Fixed tool name duplication in streaming tool calls
+- Fixed MINIO_ENDPOINT not configurable via environment variable
+- Fixed Azure OpenAI dimensions support not gated properly for non-supporting models
+- Fixed Azure OpenAI ModelMapperFunc overriding deployment names instead of preserving them as-is
+- Fixed Azure OpenAI connection test not passing provider, causing incorrect endpoint usage
+- Fixed 400 errors incorrectly treated as connection failures in model connectivity check (parameter mismatch is not a connectivity issue)
+- Fixed Dockerfile build error with duplicate libsqlite3-0 and ffmpeg installation
+- Fixed OSS S3-compatible API signature mismatch by disabling automatic checksum calculation and adjusting path-style settings
+- Fixed missing closing brace in checkOSS function
+- Fixed neo4j driver compatibility with Go 1.24 on Windows: reverted to v6 with -p=1 compiler workaround
+
+### 🔧 Refactoring
+- Replaced CryptoService with lightweight utils AES helpers, simplifying encryption logic across the codebase
+- Optimized OSS storage initialization, URL formatting, and security handling for improved S3 compatibility
+- Enhanced WeKnora Cloud internationalization and UI feedback for credential management operations
+
+### 📚 Documentation
+- Added VectorStore CRUD API endpoint documentation with Swagger annotations
+- Added Alibaba Cloud OSS support documentation and API descriptions
+
+## [0.3.6] - 2026-04-03
+
+### 🚀 New Features
+- **NEW**: ASR (Automatic Speech Recognition) — integrated ASR model support with audio file upload, in-document audio preview, and transcription capabilities; added ASR model connectivity check endpoint
+- **NEW**: Data Source Auto-Sync (Feishu) — complete data source management with CRUD operations, Feishu Wiki/Drive auto-sync (incremental and full), sync logs with polling, tenant isolation, and data source type icons
+- **NEW**: OIDC Authentication — OpenID Connect (OIDC) login support with auto-discovery, custom endpoint configuration, and user info field mapping
+- **NEW**: IM Quote/Reply Context — extract quoted messages in IM channels (WeCom) and inject QuotedContext into LLM prompts for contextual replies; anti-hallucination handling for non-text quotes and unprocessable media
+- **NEW**: Thread-Based IM Sessions — per-thread session mode for IM channels (Slack, Mattermost, Feishu, Telegram), enabling multi-user collaboration within message threads
+- **NEW**: Document Summarization — AI-generated document summaries with configurable max_input_chars, dedicated summary section in document detail view with loading states
+- **NEW**: Tavily Web Search Provider — added Tavily as a web search provider option; refactored web search provider architecture for extensibility
+- **NEW**: MCP Auto-Reconnection — automatic reconnection logic for MCP tool calls and tool listing when server connection is lost
+- **NEW**: Parallel Tool Calling — concurrent execution of multiple tool calls in agent mode via errgroup when ParallelToolCalls is enabled; sequential execution remains default
+- **NEW**: Agent @Mention Scope Restriction — restrict user @mentions to agent's allowed knowledge base scope, preventing unauthorized access to knowledge bases and knowledge entries
+
+### ⚡ Improvements
+- Refined parent-child chunk replacement logic to only apply to text chunks whose parent is a parent_text chunk
+- Optimized login page rendering performance: removed all backdrop-filter blur, reduced animated elements, added GPU compositing hints and prefers-reduced-motion support
+- Unified NVIDIA API for both chat and VLM model types
+- Prompt language fallback now uses WEKNORA_LANGUAGE environment variable instead of hardcoded zh-CN, with language propagated through document and image processing pipelines
+- Fixed enable_thinking for Aliyun Qwen models in streaming mode
+- Enhanced document processing with metadata extraction and handling
+- Added header tracking for Markdown tables during chunking to preserve table context
+- Elasticsearch ID field handling with dynamic .keyword suffix detection based on index mapping
+- Added DOCREADER_DOCX_MAX_PAGES environment variable to limit DOCX parsing for large documents
+- Knowledge tag batch update now includes authorization checks with agent-scoped KB access validation
+- System proxy support for remote API calls
+- DatabaseQueryTool enhanced with search scope filtering
+
+### 🐛 Bug Fixes
+- Fixed WeCom group chat @mention not being stripped from message text, causing all slash commands to fail
+- Fixed SSEReader returning errors.New("EOF") instead of io.EOF, causing silent stream termination without done response
+- Fixed extracted images not being deleted from storage when knowledge is removed, preventing orphan file accumulation
+- Fixed S3 provider scheme not recognized in frontend/backend allowlists; added auto path-style addressing for non-AWS S3-compatible endpoints
+- Fixed remote images in markdown files not being resolved during file upload (only base64/inline were handled)
+- Fixed SSRF validation lacking IPv6 support; added IPv6 address and CIDR handling in whitelist mechanism
+- Fixed web_fetch using removed IsSSRFSafeURL function; replaced with ValidateURLForSSRF
+- Fixed mermaid diagrams not rendering on page refresh
+- Fixed doc-content.vue renderer incompatible with marked v5+ token API
+- Fixed null reference error when rendering empty markdown code blocks
+- Fixed frontend using legacy storage_config instead of storage_provider_config, causing incorrect storage provider display
+- Fixed knowledge document category not deselectable by clicking again
+- Fixed duplicate click binding in frontend components
+- Fixed migration numbering errors and removed broken update_updated_at_column trigger
+- Fixed monkey patch for docx parse error handling
+
+### 📚 Documentation
+- Enhanced agent and knowledge base API documentation
+- Added data source import documentation with architecture overview and quick start guide
+- Updated README files with streamlined sections and feature overview across all languages
+- Updated architecture diagram
+
+### 🔧 Refactoring
+- Improved question generation prompt template with better guidelines and context handling
+- Simplified temperature option handling in chat request builders
+
 ## [0.3.5] - 2026-03-27
 
 ### 🚀 New Features
@@ -792,6 +922,9 @@ All notable changes to this project will be documented in this file.
 - Docker Compose for quick startup and service orchestration.
 - MCP server support for integrating with MCP-compatible clients.
 
+[0.5.0]: https://github.com/Tencent/WeKnora/tree/v0.5.0
+[0.4.0]: https://github.com/Tencent/WeKnora/tree/v0.4.0
+[0.3.6]: https://github.com/Tencent/WeKnora/tree/v0.3.6
 [0.3.5]: https://github.com/Tencent/WeKnora/tree/v0.3.5
 [0.3.4]: https://github.com/Tencent/WeKnora/tree/v0.3.4
 [0.3.3]: https://github.com/Tencent/WeKnora/tree/v0.3.3

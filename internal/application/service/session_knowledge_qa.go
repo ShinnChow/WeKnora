@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/agent/tools"
 	chatpipeline "github.com/Tencent/WeKnora/internal/application/service/chat_pipeline"
 	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/event"
@@ -114,15 +115,21 @@ func (s *sessionService) KnowledgeQA(
 			RewritePromptSystem:     s.cfg.Conversation.RewritePromptSystem,
 			RewritePromptUser:       s.cfg.Conversation.RewritePromptUser,
 			WebSearchEnabled:        req.WebSearchEnabled,
+			WebSearchProviderID:     s.resolveWebSearchProviderID(ctx, req, retrievalTenantID),
+			WebSearchMaxResults:     s.resolveWebSearchMaxResults(ctx, req),
+			WebFetchEnabled:         s.resolveWebFetchEnabled(req),
+			WebFetchTopN:            s.resolveWebFetchTopN(req),
 			TenantID:                retrievalTenantID,
 			Images:                  req.ImageURLs,
 			VLMModelID:              vlmModelID,
 			ChatModelSupportsVision: chatModelSupportsVision,
+			Attachments:             req.Attachments,
 			Language:                types.LanguageNameFromContext(ctx),
 		},
 		PipelineState: types.PipelineState{
 			RewriteQuery:     req.Query,
 			ImageDescription: req.ImageDescription,
+			QuotedContext:    req.QuotedContext,
 		},
 		PipelineContext: types.PipelineContext{
 			EventBus:      eventBus.AsEventBusInterface(),
@@ -147,6 +154,13 @@ func (s *sessionService) KnowledgeQA(
 		if req.ImageDescription != "" && !chatModelSupportsVision {
 			userContent += "\n\n[用户上传图片内容]\n" + req.ImageDescription
 		}
+		if req.QuotedContext != "" {
+			userContent += "\n\n" + req.QuotedContext
+		}
+		// Inject attachment content for pure-chat path (RAG path handles this in INTO_CHAT_MESSAGE).
+		if len(req.Attachments) > 0 {
+			userContent += req.Attachments.BuildPrompt()
+		}
 		chatManage.UserContent = userContent
 
 		pipeline = types.NewPipelineBuilder().
@@ -162,6 +176,7 @@ func (s *sessionService) KnowledgeQA(
 			Add(types.QUERY_UNDERSTAND).
 			Add(types.CHUNK_SEARCH_PARALLEL).
 			Add(types.CHUNK_RERANK).
+			AddIf(req.WebSearchEnabled, types.WEB_FETCH).
 			Add(types.CHUNK_MERGE).
 			Add(types.FILTER_TOP_K).
 			Add(types.DATA_ANALYSIS).
@@ -314,6 +329,22 @@ func (s *sessionService) resolveKnowledgeBasesFromAgent(
 
 	switch customAgent.Config.KBSelectionMode {
 	case "all":
+		// Authoritative capability filter for the runtime path. The frontend
+		// editor and @mention dropdown apply the same filter, but we don't
+		// trust the client here: a stale session payload or API caller could
+		// still ask us to retrieve against an incompatible KB and we'd rather
+		// just drop it (and log) than feed it to tools that would no-op.
+		capFilter := tools.DeriveKBFilterFromTools(customAgent.Config.AllowedTools)
+		accept := func(kb *types.KnowledgeBase) bool {
+			if kb == nil {
+				return false
+			}
+			if capFilter.IsEmpty() {
+				return true
+			}
+			return tools.KBSatisfiesToolRequirements(kb.Capabilities(), customAgent.Config.AllowedTools)
+		}
+
 		// Get own knowledge bases (uses ctx TenantID = agent's tenant)
 		allKBs, err := s.knowledgeBaseService.ListKnowledgeBases(ctx)
 		if err != nil {
@@ -321,7 +352,12 @@ func (s *sessionService) resolveKnowledgeBasesFromAgent(
 		}
 		kbIDSet := make(map[string]bool)
 		kbIDs := make([]string, 0, len(allKBs))
+		ownSkipped := 0
 		for _, kb := range allKBs {
+			if !accept(kb) {
+				ownSkipped++
+				continue
+			}
 			kbIDs = append(kbIDs, kb.ID)
 			kbIDSet[kb.ID] = true
 		}
@@ -330,6 +366,7 @@ func (s *sessionService) resolveKnowledgeBasesFromAgent(
 		// tenant's own KBs. Including the current user's shared KBs would leak
 		// unrelated KBs from other organisations into the agent's retrieval scope.
 		isSharedAgent := sessionTenantID != 0 && sessionTenantID != customAgent.TenantID
+		sharedSkipped := 0
 		if !isSharedAgent {
 			tenantID := types.MustTenantIDFromContext(ctx)
 			userIDVal := ctx.Value(types.UserIDContextKey)
@@ -340,10 +377,15 @@ func (s *sessionService) resolveKnowledgeBasesFromAgent(
 						logger.Warnf(ctx, "Failed to list shared knowledge bases: %v", err)
 					} else {
 						for _, info := range sharedList {
-							if info != nil && info.KnowledgeBase != nil && !kbIDSet[info.KnowledgeBase.ID] {
-								kbIDs = append(kbIDs, info.KnowledgeBase.ID)
-								kbIDSet[info.KnowledgeBase.ID] = true
+							if info == nil || info.KnowledgeBase == nil || kbIDSet[info.KnowledgeBase.ID] {
+								continue
 							}
+							if !accept(info.KnowledgeBase) {
+								sharedSkipped++
+								continue
+							}
+							kbIDs = append(kbIDs, info.KnowledgeBase.ID)
+							kbIDSet[info.KnowledgeBase.ID] = true
 						}
 					}
 				}
@@ -353,6 +395,11 @@ func (s *sessionService) resolveKnowledgeBasesFromAgent(
 				sessionTenantID, customAgent.TenantID)
 		}
 
+		if ownSkipped+sharedSkipped > 0 {
+			logger.Infof(ctx,
+				"KBSelectionMode=all: tool-capability filter removed %d own + %d shared KBs (agent=%s, tools=%v)",
+				ownSkipped, sharedSkipped, customAgent.ID, customAgent.Config.AllowedTools)
+		}
 		logger.Infof(ctx, "KBSelectionMode=all: loaded %d knowledge bases (own + shared)", len(kbIDs))
 		return kbIDs
 	case "selected":
@@ -728,6 +775,9 @@ func (s *sessionService) renderFallbackPrompt(ctx context.Context, chatManage *t
 	if chatManage.ImageDescription != "" && !chatManage.ChatModelSupportsVision {
 		result += "\n\n[用户上传图片内容]\n" + chatManage.ImageDescription
 	}
+	if chatManage.QuotedContext != "" {
+		result += "\n\n" + chatManage.QuotedContext
+	}
 	return result, nil
 }
 
@@ -797,4 +847,49 @@ func (s *sessionService) emitFallbackAnswer(ctx context.Context, chatManage *typ
 	} else {
 		logger.Infof(ctx, "Fallback answer event emitted successfully")
 	}
+}
+
+// resolveWebSearchProviderID returns the web search provider ID to use for a pipeline request.
+// Priority: agent config > tenant default (is_default=true)
+func (s *sessionService) resolveWebSearchProviderID(ctx context.Context, req *types.QARequest, tenantID uint64) string {
+	// 1. Agent-level override
+	if req.CustomAgent != nil && req.CustomAgent.Config.WebSearchProviderID != "" {
+		return req.CustomAgent.Config.WebSearchProviderID
+	}
+	// 2. Tenant default
+	if s.webSearchProviderRepo != nil {
+		if defaultProvider, err := s.webSearchProviderRepo.GetDefault(ctx, tenantID); err == nil && defaultProvider != nil {
+			return defaultProvider.ID
+		}
+	}
+	return ""
+}
+
+// resolveWebFetchEnabled returns whether auto web fetch is enabled for this request.
+func (s *sessionService) resolveWebFetchEnabled(req *types.QARequest) bool {
+	if req.CustomAgent != nil {
+		return req.CustomAgent.Config.WebFetchEnabled
+	}
+	return false
+}
+
+// resolveWebFetchTopN returns how many pages to fetch after rerank.
+func (s *sessionService) resolveWebFetchTopN(req *types.QARequest) int {
+	if req.CustomAgent != nil && req.CustomAgent.Config.WebFetchTopN > 0 {
+		return req.CustomAgent.Config.WebFetchTopN
+	}
+	return 3
+}
+
+// resolveWebSearchMaxResults returns the max results for web search.
+// Priority: agent config > tenant default > default (10)
+func (s *sessionService) resolveWebSearchMaxResults(ctx context.Context, req *types.QARequest) int {
+	if req.CustomAgent != nil && req.CustomAgent.Config.WebSearchMaxResults > 0 {
+		return req.CustomAgent.Config.WebSearchMaxResults
+	}
+	tenantInfo, _ := types.TenantInfoFromContext(ctx)
+	if tenantInfo != nil && tenantInfo.WebSearchConfig != nil && tenantInfo.WebSearchConfig.MaxResults > 0 {
+		return tenantInfo.WebSearchConfig.MaxResults
+	}
+	return 10
 }

@@ -21,6 +21,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/handler/session"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/middleware"
+	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 
@@ -31,36 +32,40 @@ import (
 type RouterParams struct {
 	dig.In
 
-	Config                *config.Config
-	UserService           interfaces.UserService
-	KBService             interfaces.KnowledgeBaseService
-	KnowledgeService      interfaces.KnowledgeService
-	ChunkService          interfaces.ChunkService
-	SessionService        interfaces.SessionService
-	MessageService        interfaces.MessageService
-	ModelService          interfaces.ModelService
-	EvaluationService     interfaces.EvaluationService
-	KBHandler             *handler.KnowledgeBaseHandler
-	KnowledgeHandler      *handler.KnowledgeHandler
-	TenantHandler         *handler.TenantHandler
-	TenantService         interfaces.TenantService
-	ChunkHandler          *handler.ChunkHandler
-	SessionHandler        *session.Handler
-	MessageHandler        *handler.MessageHandler
-	ModelHandler          *handler.ModelHandler
-	EvaluationHandler     *handler.EvaluationHandler
-	AuthHandler           *handler.AuthHandler
-	InitializationHandler *handler.InitializationHandler
-	SystemHandler         *handler.SystemHandler
-	MCPServiceHandler     *handler.MCPServiceHandler
-	WebSearchHandler      *handler.WebSearchHandler
-	FAQHandler            *handler.FAQHandler
-	TagHandler            *handler.TagHandler
-	CustomAgentHandler    *handler.CustomAgentHandler
-	SkillHandler          *handler.SkillHandler
-	OrganizationHandler   *handler.OrganizationHandler
-	IMHandler             *handler.IMHandler
-	DataSourceHandler     *handler.DataSourceHandler
+	Config                   *config.Config
+	UserService              interfaces.UserService
+	KBService                interfaces.KnowledgeBaseService
+	KnowledgeService         interfaces.KnowledgeService
+	ChunkService             interfaces.ChunkService
+	SessionService           interfaces.SessionService
+	MessageService           interfaces.MessageService
+	ModelService             interfaces.ModelService
+	EvaluationService        interfaces.EvaluationService
+	KBHandler                *handler.KnowledgeBaseHandler
+	KnowledgeHandler         *handler.KnowledgeHandler
+	TenantHandler            *handler.TenantHandler
+	TenantService            interfaces.TenantService
+	ChunkHandler             *handler.ChunkHandler
+	SessionHandler           *session.Handler
+	MessageHandler           *handler.MessageHandler
+	ModelHandler             *handler.ModelHandler
+	EvaluationHandler        *handler.EvaluationHandler
+	AuthHandler              *handler.AuthHandler
+	InitializationHandler    *handler.InitializationHandler
+	SystemHandler            *handler.SystemHandler
+	MCPServiceHandler        *handler.MCPServiceHandler
+	WebSearchHandler         *handler.WebSearchHandler
+	WebSearchProviderHandler *handler.WebSearchProviderHandler
+	VectorStoreHandler       *handler.VectorStoreHandler
+	FAQHandler               *handler.FAQHandler
+	TagHandler               *handler.TagHandler
+	CustomAgentHandler       *handler.CustomAgentHandler
+	SkillHandler             *handler.SkillHandler
+	OrganizationHandler      *handler.OrganizationHandler
+	IMHandler                *handler.IMHandler
+	DataSourceHandler        *handler.DataSourceHandler
+	WeKnoraCloudHandler      *handler.WeKnoraCloudHandler
+	WikiPageHandler          *handler.WikiPageHandler
 }
 
 // NewRouter 创建新的路由
@@ -118,6 +123,10 @@ func NewRouter(params RouterParams) *gin.Engine {
 	// 添加OpenTelemetry追踪中间件
 	// r.Use(middleware.TracingMiddleware())
 
+	// Langfuse observability — only active when LANGFUSE_* env vars are set.
+	// The middleware is registered unconditionally; when disabled it's a no-op.
+	r.Use(langfuse.GinMiddleware())
+
 	// 需要认证的API路由
 	v1 := r.Group("/api/v1")
 	{
@@ -137,11 +146,15 @@ func NewRouter(params RouterParams) *gin.Engine {
 		RegisterSystemRoutes(v1, params.SystemHandler)
 		RegisterMCPServiceRoutes(v1, params.MCPServiceHandler)
 		RegisterWebSearchRoutes(v1, params.WebSearchHandler)
+		RegisterWebSearchProviderRoutes(v1, params.WebSearchProviderHandler)
+		RegisterVectorStoreRoutes(v1, params.VectorStoreHandler)
 		RegisterCustomAgentRoutes(v1, params.CustomAgentHandler)
 		RegisterSkillRoutes(v1, params.SkillHandler)
 		RegisterOrganizationRoutes(v1, params.OrganizationHandler)
 		RegisterIMChannelRoutes(v1, params.IMHandler)
 		RegisterDataSourceRoutes(v1, params.DataSourceHandler)
+		RegisterWeKnoraCloudRoutes(v1, params.WeKnoraCloudHandler)
+		RegisterWikiPageRoutes(v1, params.WikiPageHandler)
 	}
 
 	return r
@@ -395,6 +408,7 @@ func RegisterEvaluationRoutes(r *gin.RouterGroup, handler *handler.EvaluationHan
 func RegisterAuthRoutes(r *gin.RouterGroup, handler *handler.AuthHandler) {
 	r.POST("/auth/register", handler.Register)
 	r.POST("/auth/login", handler.Login)
+	r.POST("/auth/auto-setup", handler.AutoSetup)
 	r.GET("/auth/oidc/config", handler.GetOIDCConfig)
 	r.GET("/auth/oidc/url", handler.GetOIDCAuthorizationURL)
 	r.GET("/auth/oidc/callback", handler.OIDCRedirectCallback)
@@ -423,6 +437,7 @@ func RegisterInitializationRoutes(r *gin.RouterGroup, handler *handler.Initializ
 	r.POST("/initialization/remote/check", handler.CheckRemoteModel)
 	r.POST("/initialization/embedding/test", handler.TestEmbeddingModel)
 	r.POST("/initialization/rerank/check", handler.CheckRerankModel)
+	r.POST("/initialization/asr/check", handler.CheckASRModel)
 	r.POST("/initialization/multimodal/test", handler.TestMultimodalFunction)
 
 	r.POST("/initialization/extract/text-relation", handler.ExtractTextRelations)
@@ -440,7 +455,6 @@ func RegisterSystemRoutes(r *gin.RouterGroup, handler *handler.SystemHandler) {
 		systemRoutes.POST("/docreader/reconnect", handler.ReconnectDocReader)
 		systemRoutes.GET("/storage-engine-status", handler.GetStorageEngineStatus)
 		systemRoutes.POST("/storage-engine-check", handler.CheckStorageEngine)
-		systemRoutes.GET("/minio/buckets", handler.ListMinioBuckets)
 	}
 }
 
@@ -477,12 +491,52 @@ func RegisterWebSearchRoutes(r *gin.RouterGroup, webSearchHandler *handler.WebSe
 	}
 }
 
+// RegisterWebSearchProviderRoutes registers CRUD routes for web search provider configurations
+func RegisterWebSearchProviderRoutes(r *gin.RouterGroup, h *handler.WebSearchProviderHandler) {
+	providers := r.Group("/web-search-providers")
+	{
+		// List available provider types (metadata for UI forms)
+		providers.GET("/types", h.ListProviderTypes)
+		// Test with raw credentials (no persistence)
+		providers.POST("/test", h.TestProviderRaw)
+		// CRUD
+		providers.POST("", h.CreateProvider)
+		providers.GET("", h.ListProviders)
+		providers.GET("/:id", h.GetProvider)
+		providers.PUT("/:id", h.UpdateProvider)
+		providers.DELETE("/:id", h.DeleteProvider)
+		// Test existing saved provider
+		providers.POST("/:id/test", h.TestProviderByID)
+	}
+}
+
+// RegisterVectorStoreRoutes registers CRUD routes for vector store configurations
+func RegisterVectorStoreRoutes(r *gin.RouterGroup, h *handler.VectorStoreHandler) {
+	stores := r.Group("/vector-stores")
+	{
+		// List available engine types (metadata for UI forms)
+		stores.GET("/types", h.ListStoreTypes)
+		// Test with raw credentials (no persistence)
+		stores.POST("/test", h.TestStoreRaw)
+		// CRUD
+		stores.POST("", h.CreateStore)
+		stores.GET("", h.ListStores)
+		stores.GET("/:id", h.GetStore)
+		stores.PUT("/:id", h.UpdateStore)
+		stores.DELETE("/:id", h.DeleteStore)
+		// Test existing saved or env store
+		stores.POST("/:id/test", h.TestStoreByID)
+	}
+}
+
 // RegisterCustomAgentRoutes registers custom agent routes
 func RegisterCustomAgentRoutes(r *gin.RouterGroup, agentHandler *handler.CustomAgentHandler) {
 	agents := r.Group("/agents")
 	{
 		// Get placeholder definitions (must be before /:id to avoid conflict)
 		agents.GET("/placeholders", agentHandler.GetPlaceholders)
+		// List smart-reasoning agent type presets (rag-qa / wiki-qa / hybrid / custom)
+		agents.GET("/type-presets", agentHandler.GetAgentTypePresets)
 		// Create custom agent
 		agents.POST("", agentHandler.CreateAgent)
 		// List all agents (including built-in)
@@ -617,6 +671,13 @@ func RegisterIMChannelRoutes(r *gin.RouterGroup, imHandler *handler.IMHandler) {
 		channels.PUT("/:id", imHandler.UpdateIMChannel)
 		channels.DELETE("/:id", imHandler.DeleteIMChannel)
 		channels.POST("/:id/toggle", imHandler.ToggleIMChannel)
+	}
+
+	// WeChat QR code login (requires authentication)
+	wechatGroup := r.Group("/wechat")
+	{
+		wechatGroup.POST("/qrcode", imHandler.WeChatGetQRCode)
+		wechatGroup.POST("/qrcode/status", imHandler.WeChatPollQRCodeStatus)
 	}
 }
 
@@ -773,5 +834,42 @@ func RegisterDataSourceRoutes(r *gin.RouterGroup, handler *handler.DataSourceHan
 		// Sync logs
 		ds.GET("/:id/logs", handler.GetSyncLogs)
 		ds.GET("/logs/:log_id", handler.GetSyncLog)
+	}
+}
+
+// RegisterWeKnoraCloudRoutes 注册 WeKnoraCloud 初始化路由
+func RegisterWeKnoraCloudRoutes(r *gin.RouterGroup, handler *handler.WeKnoraCloudHandler) {
+	r.POST("/weknoracloud/credentials", handler.SaveCredentials)
+	r.GET("/models/weknoracloud/status", handler.Status)
+}
+
+// RegisterWikiPageRoutes registers wiki page related routes
+func RegisterWikiPageRoutes(r *gin.RouterGroup, wikiHandler *handler.WikiPageHandler) {
+	wiki := r.Group("/knowledgebase/:kb_id/wiki")
+	{
+		// Page CRUD
+		wiki.GET("/pages", wikiHandler.ListPages)
+		wiki.POST("/pages", wikiHandler.CreatePage)
+		wiki.GET("/pages/*slug", wikiHandler.GetPage)
+		wiki.PUT("/pages/*slug", wikiHandler.UpdatePage)
+		wiki.DELETE("/pages/*slug", wikiHandler.DeletePage)
+
+		// Special pages
+		wiki.GET("/index", wikiHandler.GetIndex)
+		wiki.GET("/log", wikiHandler.GetLog)
+
+		// Graph and stats
+		wiki.GET("/graph", wikiHandler.GetGraph)
+		wiki.GET("/stats", wikiHandler.GetStats)
+
+		// Search and maintenance
+		wiki.GET("/search", wikiHandler.SearchPages)
+		wiki.POST("/rebuild-links", wikiHandler.RebuildLinks)
+		wiki.GET("/lint", wikiHandler.Lint)
+		wiki.POST("/auto-fix", wikiHandler.AutoFix)
+
+		// Issues
+		wiki.GET("/issues", wikiHandler.ListIssues)
+		wiki.PUT("/issues/:issue_id/status", wikiHandler.UpdateIssueStatus)
 	}
 }
