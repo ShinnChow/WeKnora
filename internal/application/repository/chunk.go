@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -23,14 +24,33 @@ func NewChunkRepository(db *gorm.DB) interfaces.ChunkRepository {
 	return &chunkRepository{db: db}
 }
 
-// CreateChunks creates multiple chunks in batches
+// CreateChunks creates multiple chunks in batches.
+// Uses Omit("SeqID") so GORM won't include the auto-increment column in the
+// INSERT, which avoids MySQL generating ON DUPLICATE KEY UPDATE and the
+// resulting gap-lock deadlocks under concurrent writes.
+// A deadlock retry wrapper is kept as defense-in-depth for any remaining
+// edge cases on secondary unique indexes.
 func (r *chunkRepository) CreateChunks(ctx context.Context, chunks []*types.Chunk) error {
 	for _, chunk := range chunks {
 		chunk.Content = common.CleanInvalidUTF8(chunk.Content)
 	}
-	// Use Select("*") to ensure all fields including zero values (IsEnabled=false, Flags=0)
-	// are inserted, bypassing GORM's default value behavior for zero values
-	return r.db.WithContext(ctx).Select("*").CreateInBatches(chunks, 100).Error
+
+	db := r.db.WithContext(ctx)
+
+	// SQLite doesn't support autoIncrement on non-PK columns,
+	// so we must pre-assign SeqIDs manually (safe: single connection).
+	// PostgreSQL / MySQL use DB sequences — skip to avoid duplicate key
+	// races under concurrent inserts.
+	if db.Dialector.Name() == "sqlite" {
+		if err := types.AssignChunkSeqIDs(db, chunks); err != nil {
+			return fmt.Errorf("failed to assign chunk seq_ids: %w", err)
+		}
+	}
+
+	// Select("*") ensures zero-value fields (IsEnabled=false, Flags=0) are
+	// explicitly inserted, bypassing GORM's default value behavior.
+	// SeqID=0 is skipped by GORM automatically (autoIncrement tag).
+	return db.Select("*").CreateInBatches(chunks, 100).Error
 }
 
 // GetChunkByID retrieves a chunk by its ID and tenant ID
@@ -379,7 +399,7 @@ func (r *chunkRepository) UpdateChunks(ctx context.Context, chunks []*types.Chun
 				tag_id = CASE %s END,
 				flags = CASE %s END,
 				status = CASE %s END,
-				updated_at = NOW()
+				updated_at = datetime('now')
 			WHERE id IN (%s)
 		`,
 			strings.Join(contentCases, " "),
@@ -423,6 +443,20 @@ func (r *chunkRepository) DeleteChunksByKnowledgeID(ctx context.Context, tenantI
 	return r.db.WithContext(ctx).Where(
 		"tenant_id = ? AND knowledge_id = ?", tenantID, knowledgeID,
 	).Delete(&types.Chunk{}).Error
+}
+
+// ListImageInfoByKnowledgeIDs returns non-empty image_info values for the given knowledge IDs.
+// No chunk_type filter — collects from text, image_ocr, and image_caption chunks.
+func (r *chunkRepository) ListImageInfoByKnowledgeIDs(
+	ctx context.Context, tenantID uint64, knowledgeIDs []string,
+) ([]interfaces.ChunkImageInfo, error) {
+	var results []interfaces.ChunkImageInfo
+	err := r.db.WithContext(ctx).
+		Model(&types.Chunk{}).
+		Select("knowledge_id, image_info").
+		Where("tenant_id = ? AND knowledge_id IN ? AND image_info != ''", tenantID, knowledgeIDs).
+		Scan(&results).Error
+	return results, err
 }
 
 // DeleteByKnowledgeList deletes all chunks for a knowledge list
@@ -769,14 +803,18 @@ func (r *chunkRepository) UpdateChunkFlagsBatch(
 		inPlaceholders[i] = "?"
 	}
 
+	nowFunc := "NOW()"
+	if r.db.Dialector.Name() == "sqlite" {
+		nowFunc = "datetime('now')"
+	}
 	sql := fmt.Sprintf(`
-	UPDATE chunks 
+	UPDATE chunks
     SET flags = (flags | (%s)) & ~(%s),
-        updated_at = NOW()
-    WHERE tenant_id = ? 
+        updated_at = %s
+    WHERE tenant_id = ?
       AND knowledge_base_id = ?
       AND id IN (%s)
-`, setExpr, clearExpr, strings.Join(inPlaceholders, ","))
+`, setExpr, clearExpr, nowFunc, strings.Join(inPlaceholders, ","))
 
 	args = append(args, tenantID, kbID)
 	for _, id := range allIDs {
@@ -828,7 +866,7 @@ func (r *chunkRepository) UpdateChunkFieldsByTagID(
 
 	// Build update query
 	updates := map[string]interface{}{
-		"updated_at": "NOW()",
+		"updated_at": time.Now(),
 	}
 
 	if isEnabled != nil {
@@ -929,7 +967,7 @@ func (r *chunkRepository) ListRecommendedFAQChunks(
 	}
 	var chunks []*types.Chunk
 	query := r.db.WithContext(ctx).
-		Select("id, knowledge_base_id, chunk_type, metadata, flags, updated_at").
+		Select("id, knowledge_id, knowledge_base_id, chunk_type, metadata, flags, updated_at").
 		Where("tenant_id = ? AND chunk_type = ? AND status IN ? AND is_enabled = ? AND flags & ? != 0",
 			tenantID, types.ChunkTypeFAQ, []int{int(types.ChunkStatusIndexed), int(types.ChunkStatusDefault)}, true, int(types.ChunkFlagRecommended))
 	if len(knowledgeIDs) > 0 {
@@ -938,8 +976,14 @@ func (r *chunkRepository) ListRecommendedFAQChunks(
 	} else {
 		query = query.Where("knowledge_base_id IN ?", kbIDs)
 	}
+
+	orderClause := "RANDOM()"
+	if r.db.Dialector.Name() == "mysql" {
+		orderClause = "RAND()"
+	}
+
 	if err := query.
-		Order("updated_at DESC").
+		Order(orderClause).
 		Limit(limit).
 		Find(&chunks).Error; err != nil {
 		return nil, err
@@ -966,7 +1010,7 @@ func (r *chunkRepository) ListRecentDocumentChunksWithQuestions(
 	var chunks []*types.Chunk
 
 	baseQuery := r.db.WithContext(ctx).
-		Select("id, knowledge_base_id, chunk_type, metadata, updated_at").
+		Select("id, knowledge_id, knowledge_base_id, chunk_type, metadata, updated_at").
 		Where("tenant_id = ? AND chunk_type = ? AND status IN ? AND is_enabled = ?",
 			tenantID, types.ChunkTypeText, []int{int(types.ChunkStatusIndexed), int(types.ChunkStatusDefault)}, true)
 
@@ -979,12 +1023,17 @@ func (r *chunkRepository) ListRecentDocumentChunksWithQuestions(
 		baseQuery = baseQuery.Where("knowledge_base_id IN ?", kbIDs)
 	}
 
+	orderClause := "RANDOM()"
+	if r.db.Dialector.Name() == "mysql" {
+		orderClause = "RAND()"
+	}
+
 	// Query chunks that have non-empty generated_questions in metadata
 	switch r.db.Name() {
 	case "postgres":
 		if err := baseQuery.
 			Where("metadata IS NOT NULL AND metadata::text != '{}' AND jsonb_array_length(COALESCE(metadata->'generated_questions', '[]'::jsonb)) > 0").
-			Order("updated_at DESC").
+			Order(orderClause).
 			Limit(limit).
 			Find(&chunks).Error; err != nil {
 			return nil, err
@@ -992,7 +1041,7 @@ func (r *chunkRepository) ListRecentDocumentChunksWithQuestions(
 	case "mysql":
 		if err := baseQuery.
 			Where("metadata IS NOT NULL AND JSON_LENGTH(JSON_EXTRACT(metadata, '$.generated_questions')) > 0").
-			Order("updated_at DESC").
+			Order(orderClause).
 			Limit(limit).
 			Find(&chunks).Error; err != nil {
 			return nil, err
@@ -1000,7 +1049,7 @@ func (r *chunkRepository) ListRecentDocumentChunksWithQuestions(
 	default: // sqlite
 		if err := baseQuery.
 			Where("metadata IS NOT NULL AND json_array_length(json_extract(metadata, '$.generated_questions')) > 0").
-			Order("updated_at DESC").
+			Order(orderClause).
 			Limit(limit).
 			Find(&chunks).Error; err != nil {
 			return nil, err

@@ -14,9 +14,11 @@ import (
 	"time"
 
 	chatpipeline "github.com/Tencent/WeKnora/internal/application/service/chat_pipeline"
+	"github.com/Tencent/WeKnora/internal/assets"
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/models/asr"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/models/embedding"
 	"github.com/Tencent/WeKnora/internal/models/rerank"
@@ -87,8 +89,9 @@ func NewInitializationHandler(
 // KBModelConfigRequest 知识库模型配置请求（简化版，只传模型ID）
 type KBModelConfigRequest struct {
 	LLMModelID       string           `json:"llmModelId"       binding:"required"`
-	EmbeddingModelID string           `json:"embeddingModelId" binding:"required"`
+	EmbeddingModelID string           `json:"embeddingModelId"` // optional when RAG indexing is disabled
 	VLMConfig        *types.VLMConfig `json:"vlm_config"`
+	ASRConfig        *types.ASRConfig `json:"asr_config"`
 
 	// 文档分块配置
 	DocumentSplitting struct {
@@ -233,7 +236,7 @@ func (h *InitializationHandler) UpdateKBConfig(c *gin.Context) {
 	}
 
 	// 检查Embedding模型是否可以修改
-	if kb.EmbeddingModelID != "" && kb.EmbeddingModelID != req.EmbeddingModelID {
+	if kb.EmbeddingModelID != "" && req.EmbeddingModelID != "" && kb.EmbeddingModelID != req.EmbeddingModelID {
 		// 检查是否已有文件
 		knowledgeList, err := h.knowledgeService.ListPagedKnowledgeByKnowledgeBaseID(ctx,
 			kbIdStr, &types.Pagination{
@@ -255,16 +258,21 @@ func (h *InitializationHandler) UpdateKBConfig(c *gin.Context) {
 		return
 	}
 
-	embeddingModel, err := h.modelService.GetModelByID(ctx, req.EmbeddingModelID)
-	if err != nil || embeddingModel == nil {
-		logger.Error(ctx, "Embedding model not found")
-		c.Error(errors.NewBadRequestError("Embedding模型不存在"))
-		return
+	// Embedding模型仅在需要时验证（RAG检索启用时）
+	if req.EmbeddingModelID != "" {
+		embeddingModel, err := h.modelService.GetModelByID(ctx, req.EmbeddingModelID)
+		if err != nil || embeddingModel == nil {
+			logger.Error(ctx, "Embedding model not found")
+			c.Error(errors.NewBadRequestError("Embedding模型不存在"))
+			return
+		}
 	}
 
 	// 更新知识库的模型ID
 	kb.SummaryModelID = req.LLMModelID
-	kb.EmbeddingModelID = req.EmbeddingModelID
+	if req.EmbeddingModelID != "" {
+		kb.EmbeddingModelID = req.EmbeddingModelID
+	}
 
 	// 处理多模态模型配置
 	kb.VLMConfig = types.VLMConfig{}
@@ -279,6 +287,19 @@ func (h *InitializationHandler) UpdateKBConfig(c *gin.Context) {
 	}
 	if !kb.VLMConfig.Enabled {
 		kb.VLMConfig.ModelID = ""
+	}
+
+	// 处理ASR语音识别配置
+	kb.ASRConfig = types.ASRConfig{}
+	if req.ASRConfig != nil && req.ASRConfig.Enabled && req.ASRConfig.ModelID != "" {
+		asrModel, err := h.modelService.GetModelByID(ctx, req.ASRConfig.ModelID)
+		if err != nil || asrModel == nil {
+			logger.Warn(ctx, "ASR model not found")
+		} else {
+			kb.ASRConfig.Enabled = true
+			kb.ASRConfig.ModelID = req.ASRConfig.ModelID
+			kb.ASRConfig.Language = req.ASRConfig.Language
+		}
 	}
 
 	// 更新文档分块配置
@@ -311,6 +332,10 @@ func (h *InitializationHandler) UpdateKBConfig(c *gin.Context) {
 	provider := strings.ToLower(strings.TrimSpace(req.StorageProvider))
 	if provider == "" {
 		provider = "local"
+	}
+	if !isStorageProviderAllowed(provider) {
+		c.Error(errors.NewBadRequestError("Storage provider is not allowed by STORAGE_ALLOW_LIST"))
+		return
 	}
 	oldProvider := kb.GetStorageProvider()
 	if oldProvider == "" {
@@ -1447,11 +1472,76 @@ func (h *InitializationHandler) buildConfigResponse(ctx context.Context, models 
 	return config
 }
 
-// RemoteModelCheckRequest 远程模型检查请求结构
-type RemoteModelCheckRequest struct {
-	ModelName string `json:"modelName" binding:"required"`
-	BaseURL   string `json:"baseUrl"   binding:"required"`
-	APIKey    string `json:"apiKey"`
+// ModelTestRequest 统一的"测试连接"请求体。
+//
+// 四种模型（chat/embedding/rerank/asr）的测试接口共享同一份结构，以便：
+//   - 前端只需维护一份表单 → 后端映射。
+//   - 后端可以直接把请求转成 *types.Model，再调用各包的 ConfigFromModel，
+//     与生产路径（service.modelService.GetXxxModel）走完全相同的装配流程，
+//     彻底消除过去每个测试端点手工拼 Config 的样板代码。
+//
+// 所有 provider/model 通用字段都在这里集中声明；若未来新增字段（比如现在的
+// custom_headers），只需改一处，生产路径和测试路径会同时生效。
+type ModelTestRequest struct {
+	Source        string            `json:"source"` // 为空时按需默认为 "remote"
+	ModelName     string            `json:"modelName" binding:"required"`
+	BaseURL       string            `json:"baseUrl"`
+	APIKey        string            `json:"apiKey"`
+	Provider      string            `json:"provider"`
+	InterfaceType string            `json:"interfaceType,omitempty"`
+	Dimension     int               `json:"dimension,omitempty"`
+	CustomHeaders map[string]string `json:"customHeaders,omitempty"`
+	ExtraConfig   map[string]string `json:"extraConfig,omitempty"`
+}
+
+// RemoteModelCheckRequest 兼容旧 swagger 定义。
+//
+// Deprecated: 保留是为了不破坏已生成的 API 文档，新代码请直接使用 ModelTestRequest。
+type RemoteModelCheckRequest = ModelTestRequest
+
+// buildTestModel 把测试连接请求转成一个临时的 *types.Model（不落库），
+// 供 ConfigFromModel 使用。source 为空时按 defaultSource 兜底（chat/rerank/asr
+// 默认 remote，embedding 会根据前端传入的 source 决定）。
+func (h *InitializationHandler) buildTestModel(
+	req *ModelTestRequest, modelType types.ModelType, defaultSource types.ModelSource,
+) *types.Model {
+	source := types.ModelSource(strings.ToLower(req.Source))
+	if source == "" {
+		source = defaultSource
+	}
+	return &types.Model{
+		Name:   req.ModelName,
+		Type:   modelType,
+		Source: source,
+		Parameters: types.ModelParameters{
+			BaseURL:       req.BaseURL,
+			APIKey:        req.APIKey,
+			Provider:      req.Provider,
+			InterfaceType: req.InterfaceType,
+			ExtraConfig:   req.ExtraConfig,
+			CustomHeaders: req.CustomHeaders,
+			EmbeddingParameters: types.EmbeddingParameters{
+				Dimension:            req.Dimension,
+				TruncatePromptTokens: 256,
+			},
+		},
+	}
+}
+
+// resolveTenantWeKnoraCloudCreds 从当前租户上下文里取出 WeKnoraCloud 凭证，
+// 供测试连接端点补齐 appID/appSecret。与 service.resolveWeKnoraCloudCredentials
+// 对应，但因为 handler 还没有被注入 tenantService（历史原因），暂时从
+// TenantInfoFromContext 读取，等效果相同。
+func (h *InitializationHandler) resolveTenantWeKnoraCloudCreds(ctx context.Context) (string, string, bool) {
+	tenantInfo, ok := types.TenantInfoFromContext(ctx)
+	if !ok {
+		return "", "", false
+	}
+	creds := tenantInfo.Credentials.GetWeKnoraCloud()
+	if creds == nil {
+		return "", "", true
+	}
+	return creds.AppID, creds.AppSecret, true
 }
 
 // CheckRemoteModel godoc
@@ -1471,40 +1561,33 @@ func (h *InitializationHandler) CheckRemoteModel(c *gin.Context) {
 
 	logger.Info(ctx, "Checking remote model connection")
 
-	var req RemoteModelCheckRequest
+	var req ModelTestRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		logger.Error(ctx, "Failed to parse remote model check request", err)
 		c.Error(errors.NewBadRequestError(err.Error()))
 		return
 	}
 
-	// 验证请求参数
 	if req.ModelName == "" || req.BaseURL == "" {
 		logger.Error(ctx, "Model name and base URL are required")
 		c.Error(errors.NewBadRequestError("模型名称和Base URL不能为空"))
 		return
 	}
 
-	// SSRF validation
 	if err := utils.ValidateURLForSSRF(req.BaseURL); err != nil {
 		logger.Warnf(ctx, "SSRF validation failed for remote model BaseURL: %v", err)
 		c.Error(errors.NewBadRequestError(fmt.Sprintf("Base URL 未通过安全校验: %v", err)))
 		return
 	}
-
-	// 创建模型配置进行测试
-	modelConfig := &types.Model{
-		Name:   req.ModelName,
-		Source: "remote",
-		Parameters: types.ModelParameters{
-			BaseURL: req.BaseURL,
-			APIKey:  req.APIKey,
-		},
-		Type: "llm", // 默认类型，实际检查时不区分具体类型
+	appID, appSecret, ok := h.resolveTenantWeKnoraCloudCreds(ctx)
+	if !ok {
+		logger.Error(ctx, "Tenant info not found")
+		c.Error(errors.NewBadRequestError("租户信息未找到"))
+		return
 	}
 
-	// 检查远程模型连接
-	available, message := h.checkRemoteModelConnection(ctx, modelConfig)
+	model := h.buildTestModel(&req, types.ModelTypeKnowledgeQA, types.ModelSourceRemote)
+	available, message := h.checkChatModelConnection(ctx, model, appID, appSecret)
 
 	logger.Infof(ctx, "Remote model check completed, available: %v, message: %s", available, message)
 
@@ -1534,22 +1617,16 @@ func (h *InitializationHandler) TestEmbeddingModel(c *gin.Context) {
 
 	logger.Info(ctx, "Testing embedding model connectivity and functionality")
 
-	var req struct {
-		Source    string `json:"source" binding:"required"`
-		ModelName string `json:"modelName" binding:"required"`
-		BaseURL   string `json:"baseUrl"`
-		APIKey    string `json:"apiKey"`
-		Dimension int    `json:"dimension"`
-		Provider  string `json:"provider"`
-	}
-
+	var req ModelTestRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		logger.Error(ctx, "Failed to parse embedding test request", err)
 		c.Error(errors.NewBadRequestError(err.Error()))
 		return
 	}
+	if req.Source == "" {
+		req.Source = string(types.ModelSourceRemote)
+	}
 
-	// SSRF validation for embedding BaseURL
 	if req.BaseURL != "" {
 		if err := utils.ValidateURLForSSRF(req.BaseURL); err != nil {
 			logger.Warnf(ctx, "SSRF validation failed for embedding BaseURL: %v", err)
@@ -1558,7 +1635,7 @@ func (h *InitializationHandler) TestEmbeddingModel(c *gin.Context) {
 		}
 	}
 
-	// 检查是否是阿里云多模态 embedding 模型（暂不支持）
+	// 阿里云多模态 Embedding 模型暂不支持
 	if strings.ToLower(req.Provider) == "aliyun" {
 		modelNameLower := strings.ToLower(req.ModelName)
 		if strings.Contains(modelNameLower, "vision") || strings.Contains(modelNameLower, "multimodal") {
@@ -1575,19 +1652,15 @@ func (h *InitializationHandler) TestEmbeddingModel(c *gin.Context) {
 		}
 	}
 
-	// 构造 embedder 配置
-	cfg := embedding.Config{
-		Source:               types.ModelSource(strings.ToLower(req.Source)),
-		BaseURL:              req.BaseURL,
-		ModelName:            req.ModelName,
-		APIKey:               req.APIKey,
-		TruncatePromptTokens: 256,
-		Dimensions:           req.Dimension,
-		ModelID:              "",
-		Provider:             req.Provider,
+	appID, appSecret, ok := h.resolveTenantWeKnoraCloudCreds(ctx)
+	if !ok {
+		logger.Error(ctx, "Tenant info not found")
+		c.Error(errors.NewBadRequestError("租户信息未找到"))
+		return
 	}
 
-	emb, err := embedding.NewEmbedder(cfg, h.pooler, h.ollamaService)
+	model := h.buildTestModel(&req, types.ModelTypeEmbedding, types.ModelSourceRemote)
+	emb, err := embedding.NewEmbedder(embedding.ConfigFromModel(model, appID, appSecret), h.pooler, h.ollamaService)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{"model": utils.SanitizeForLog(req.ModelName)})
 		c.JSON(http.StatusOK, gin.H{
@@ -1597,11 +1670,9 @@ func (h *InitializationHandler) TestEmbeddingModel(c *gin.Context) {
 		return
 	}
 
-	// 执行一次最小化 embedding 调用
-	sample := "hello"
-	vec, err := emb.Embed(ctx, sample)
+	vec, err := emb.Embed(ctx, "hello")
 	if err != nil {
-		logger.Error(ctx, "Failed to create embedder", err)
+		logger.Error(ctx, "Failed to call embedder", err)
 		c.JSON(http.StatusOK, gin.H{
 			"success": true,
 			"data":    gin.H{`available`: false, `message`: fmt.Sprintf("调用Embedding失败: %v", err), `dimension`: 0},
@@ -1616,52 +1687,39 @@ func (h *InitializationHandler) TestEmbeddingModel(c *gin.Context) {
 	})
 }
 
-// checkRemoteModelConnection 检查远程模型连接的内部方法
-func (h *InitializationHandler) checkRemoteModelConnection(ctx context.Context,
-	model *types.Model,
+// checkChatModelConnection 使用 chat 模块做一次最小化调用来测试连通性与鉴权。
+// 与生产路径走完全相同的 ConfigFromModel → NewChat 流程，因此 CustomHeaders、
+// ExtraConfig、Provider 等字段都会被正确透传。
+func (h *InitializationHandler) checkChatModelConnection(
+	ctx context.Context, model *types.Model, appID, appSecret string,
 ) (bool, string) {
-	// 使用 models/chat 进行连接检查
-	// 创建聊天配置
-	chatConfig := &chat.ChatConfig{
-		Source:    types.ModelSourceRemote,
-		BaseURL:   model.Parameters.BaseURL,
-		ModelName: model.Name,
-		APIKey:    model.Parameters.APIKey,
-		ModelID:   model.Name,
-	}
-
-	// 创建聊天实例
-	chatInstance, err := chat.NewChat(chatConfig, h.ollamaService)
+	chatInstance, err := chat.NewChat(chat.ConfigFromModel(model, appID, appSecret), h.ollamaService)
 	if err != nil {
 		return false, fmt.Sprintf("创建聊天实例失败: %v", err)
 	}
 
-	// 构造测试消息
-	testMessages := []chat.Message{
-		{
-			Role:    "user",
-			Content: "test",
-		},
-	}
-
-	// 构造测试选项
+	testMessages := []chat.Message{{Role: "user", Content: "test"}}
 	testOptions := &chat.ChatOptions{
 		MaxTokens: 1,
 		Thinking:  &[]bool{false}[0], // for dashscope.aliyuncs qwen3-32b
 	}
 
-	// 使用聊天实例进行测试
 	_, err = chatInstance.Chat(ctx, testMessages, testOptions)
 	if err != nil {
+		errMsg := err.Error()
 		// 根据错误类型返回不同的错误信息
-		if strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "unauthorized") {
+		if strings.Contains(errMsg, "401") || strings.Contains(errMsg, "unauthorized") {
 			return false, "认证失败，请检查API Key"
-		} else if strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), "forbidden") {
-			return false, "权限不足，请检查API Key权限：" + err.Error()
-		} else if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "not found") {
+		} else if strings.Contains(errMsg, "403") || strings.Contains(errMsg, "forbidden") {
+			return false, "权限不足，请检查API Key权限：" + errMsg
+		} else if strings.Contains(errMsg, "404") || strings.Contains(errMsg, "not found") {
 			return false, "API端点不存在，请检查Base URL"
-		} else if strings.Contains(err.Error(), "timeout") {
+		} else if strings.Contains(errMsg, "timeout") {
 			return false, "连接超时，请检查网络连接"
+		} else if strings.Contains(errMsg, "status code: 400") {
+			// 400 错误说明 API 端点可达、认证通过，只是请求参数不兼容（如 max_tokens vs max_completion_tokens）
+			// 视为连接成功
+			return true, "连接正常，模型可用"
 		} else {
 			return false, fmt.Sprintf("连接失败: %v", err)
 		}
@@ -1671,42 +1729,24 @@ func (h *InitializationHandler) checkRemoteModelConnection(ctx context.Context,
 	return true, "连接正常，模型可用"
 }
 
-// checkRerankModelConnection 检查Rerank模型连接和功能的内部方法
-func (h *InitializationHandler) checkRerankModelConnection(ctx context.Context,
-	modelName, baseURL, apiKey string,
+// checkRerankModelConnection 使用 rerank 模块做一次最小化调用来测试连通性与鉴权。
+// 与生产路径共用 ConfigFromModel，所有字段（CustomHeaders 等）都透传。
+func (h *InitializationHandler) checkRerankModelConnection(
+	ctx context.Context, model *types.Model, appID, appSecret string,
 ) (bool, string) {
-	// 创建Reranker配置
-	config := &rerank.RerankerConfig{
-		APIKey:    apiKey,
-		BaseURL:   baseURL,
-		ModelName: modelName,
-		Source:    types.ModelSourceRemote, // 默认值，实际会根据URL判断
-	}
-
-	// 创建Reranker实例
-	reranker, err := rerank.NewReranker(config)
+	reranker, err := rerank.NewReranker(rerank.ConfigFromModel(model, appID, appSecret))
 	if err != nil {
 		return false, fmt.Sprintf("创建Reranker失败: %v", err)
 	}
 
-	// 简化的测试数据
-	testQuery := "ping"
-	testDocuments := []string{
-		"pong",
-	}
-
-	// 使用Reranker进行测试
-	results, err := reranker.Rerank(ctx, testQuery, testDocuments)
+	results, err := reranker.Rerank(ctx, "ping", []string{"pong"})
 	if err != nil {
 		return false, fmt.Sprintf("重排测试失败: %v", err)
 	}
-
-	// 检查结果
 	if len(results) > 0 {
 		return true, fmt.Sprintf("重排功能正常，返回%d个结果", len(results))
-	} else {
-		return false, "重排接口连接成功，但未返回重排结果"
 	}
+	return false, "重排接口连接成功，但未返回重排结果"
 }
 
 // CheckRerankModel godoc
@@ -1726,38 +1766,131 @@ func (h *InitializationHandler) CheckRerankModel(c *gin.Context) {
 
 	logger.Info(ctx, "Checking rerank model connection and functionality")
 
-	var req struct {
-		ModelName string `json:"modelName" binding:"required"`
-		BaseURL   string `json:"baseUrl" binding:"required"`
-		APIKey    string `json:"apiKey"`
-	}
-
+	var req ModelTestRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		logger.Error(ctx, "Failed to parse rerank model check request", err)
 		c.Error(errors.NewBadRequestError(err.Error()))
 		return
 	}
 
-	// 验证请求参数
 	if req.ModelName == "" || req.BaseURL == "" {
 		logger.Error(ctx, "Model name and base URL are required")
 		c.Error(errors.NewBadRequestError("模型名称和Base URL不能为空"))
 		return
 	}
 
-	// SSRF validation
 	if err := utils.ValidateURLForSSRF(req.BaseURL); err != nil {
 		logger.Warnf(ctx, "SSRF validation failed for rerank BaseURL: %v", err)
 		c.Error(errors.NewBadRequestError(fmt.Sprintf("Base URL 未通过安全校验: %v", err)))
 		return
 	}
 
-	// 检查Rerank模型连接和功能
-	available, message := h.checkRerankModelConnection(
-		ctx, req.ModelName, req.BaseURL, req.APIKey,
-	)
+	appID, appSecret, ok := h.resolveTenantWeKnoraCloudCreds(ctx)
+	if !ok {
+		logger.Error(ctx, "Tenant info not found")
+		c.Error(errors.NewBadRequestError("租户信息未找到"))
+		return
+	}
+
+	model := h.buildTestModel(&req, types.ModelTypeRerank, types.ModelSourceRemote)
+	available, message := h.checkRerankModelConnection(ctx, model, appID, appSecret)
 
 	logger.Infof(ctx, "Rerank model check completed, available: %v, message: %s", available, message)
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"available": available,
+			"message":   message,
+		},
+	})
+}
+
+// CheckASRModel godoc
+// @Summary      检查ASR模型
+// @Description  检查ASR（语音识别）模型连接是否正常，通过发送一段静默音频测试 /v1/audio/transcriptions 端点
+// @Tags         初始化
+// @Accept       json
+// @Produce      json
+// @Param        request  body      object  true  "ASR检查请求"
+// @Success      200      {object}  map[string]interface{}  "检查结果"
+// @Failure      400      {object}  errors.AppError         "请求参数错误"
+// @Security     Bearer
+// @Security     ApiKeyAuth
+// @Router       /initialization/models/asr/check [post]
+func (h *InitializationHandler) CheckASRModel(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	logger.Info(ctx, "Checking ASR model connection")
+
+	var req ModelTestRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		logger.Error(ctx, "Failed to parse ASR model check request", err)
+		c.Error(errors.NewBadRequestError(err.Error()))
+		return
+	}
+
+	if req.ModelName == "" || req.BaseURL == "" {
+		logger.Error(ctx, "Model name and base URL are required for ASR check")
+		c.Error(errors.NewBadRequestError("模型名称和Base URL不能为空"))
+		return
+	}
+
+	if err := utils.ValidateURLForSSRF(req.BaseURL); err != nil {
+		logger.Warnf(ctx, "SSRF validation failed for ASR BaseURL: %v", err)
+		c.Error(errors.NewBadRequestError(fmt.Sprintf("Base URL 未通过安全校验: %v", err)))
+		return
+	}
+
+	// 用统一构造器生成测试用 *types.Model（ASR 不涉及 WeKnoraCloud 凭证），
+	// 发送一段极短的静默 WAV 音频验证 /v1/audio/transcriptions 端点可达。
+	model := h.buildTestModel(&req, types.ModelTypeASR, types.ModelSourceRemote)
+	asrInstance, err := asr.NewASR(asr.ConfigFromModel(model))
+	if err != nil {
+		logger.Errorf(ctx, "Failed to create ASR instance for check: %v", err)
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"data": gin.H{
+				"available": false,
+				"message":   fmt.Sprintf("创建ASR实例失败: %v", err),
+			},
+		})
+		return
+	}
+
+	res, err := asrInstance.Transcribe(ctx, assets.ASRTestWAV, "asr_test.wav")
+	var text string
+	if res != nil {
+		text = res.Text
+	}
+	available := true
+	message := "ASR连接成功"
+
+	if err != nil {
+		errMsg := err.Error()
+		switch {
+		case strings.Contains(errMsg, "401") || strings.Contains(errMsg, "Unauthorized") || strings.Contains(errMsg, "authentication"):
+			available = false
+			message = "认证失败，请检查API Key"
+		case strings.Contains(errMsg, "404") || strings.Contains(errMsg, "Not Found"):
+			available = false
+			message = "API端点不存在，请检查Base URL"
+		case strings.Contains(errMsg, "connection refused") || strings.Contains(errMsg, "no such host") || strings.Contains(errMsg, "dial tcp"):
+			available = false
+			message = "无法连接到服务器，请检查Base URL"
+		case strings.Contains(errMsg, "model") && strings.Contains(errMsg, "not found"):
+			available = false
+			message = "模型不存在，请检查模型名称"
+		default:
+			logger.Infof(ctx, "ASR check got non-fatal error (endpoint reachable): %v", err)
+			available = true
+			message = fmt.Sprintf("ASR端点可达（非致命错误: %s）", errMsg)
+		}
+	} else if text != "" {
+		message = fmt.Sprintf("ASR连接成功，转写结果: %s", text)
+	}
+
+	logger.Infof(ctx, "ASR model check completed, available: %v, message: %s", available, message)
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,

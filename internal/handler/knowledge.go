@@ -13,10 +13,12 @@ import (
 
 	goerrors "errors"
 
+	"github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/application/service"
 	"github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/Tencent/WeKnora/internal/utils"
@@ -183,6 +185,29 @@ func (h *KnowledgeHandler) handleDuplicateKnowledgeError(c *gin.Context,
 		return true
 	}
 	return false
+}
+
+// enqueueKnowledgeListDelete enqueues an async batch-delete task for the
+// given knowledge IDs and returns the asynq task ID.
+func (h *KnowledgeHandler) enqueueKnowledgeListDelete(
+	ctx context.Context, tenantID uint64, ids []string,
+) (string, error) {
+	payload := types.KnowledgeListDeletePayload{
+		TenantID:     tenantID,
+		KnowledgeIDs: ids,
+	}
+	langfuse.InjectTracing(ctx, &payload)
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal payload: %w", err)
+	}
+	task := asynq.NewTask(types.TypeKnowledgeListDelete, payloadBytes,
+		asynq.Queue("low"), asynq.MaxRetry(3))
+	info, err := h.asynqClient.Enqueue(task)
+	if err != nil {
+		return "", fmt.Errorf("enqueue task: %w", err)
+	}
+	return info.ID, nil
 }
 
 // CreateKnowledgeFromFile godoc
@@ -627,6 +652,112 @@ func (h *KnowledgeHandler) DeleteKnowledge(c *gin.Context) {
 	})
 }
 
+// BatchDeleteKnowledgeRequest is the body schema for POST /knowledge/batch-delete.
+type BatchDeleteKnowledgeRequest struct {
+	KBID string   `json:"kb_id" binding:"required"`
+	IDs  []string `json:"ids"  binding:"required"`
+}
+
+// BatchDeleteKnowledge godoc
+// @Summary      批量删除知识
+// @Description  按 ID 列表批量删除单个知识库下的多个知识条目
+// @Tags         知识管理
+// @Accept       json
+// @Produce      json
+// @Param        request  body      BatchDeleteKnowledgeRequest  true  "批量删除请求"
+// @Success      200      {object}  map[string]interface{}       "删除成功"
+// @Failure      400      {object}  errors.AppError              "请求参数错误"
+// @Failure      403      {object}  errors.AppError              "权限不足"
+// @Security     Bearer
+// @Security     ApiKeyAuth
+// @Router       /knowledge/batch-delete [post]
+func (h *KnowledgeHandler) BatchDeleteKnowledge(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	var req BatchDeleteKnowledgeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.Error(errors.NewBadRequestError("Invalid request parameters: " + err.Error()))
+		return
+	}
+
+	// Deduplicate and drop empty IDs.
+	seen := make(map[string]struct{}, len(req.IDs))
+	ids := make([]string, 0, len(req.IDs))
+	for _, raw := range req.IDs {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		c.Error(errors.NewBadRequestError("ids cannot be empty"))
+		return
+	}
+	const maxBatch = 200
+	if len(ids) > maxBatch {
+		c.Error(errors.NewBadRequestError(fmt.Sprintf("too many ids (max %d per batch)", maxBatch)))
+		return
+	}
+
+	// Validate KB access (editor or admin) using the kb_id from body.
+	_, kbID, effectiveTenantID, permission, err := h.validateKnowledgeBaseAccessWithKBID(c, req.KBID)
+	if err != nil {
+		c.Error(err)
+		return
+	}
+	if permission != types.OrgRoleAdmin && permission != types.OrgRoleEditor {
+		c.Error(errors.NewForbiddenError("No permission to delete knowledge"))
+		return
+	}
+	ctx = context.WithValue(ctx, types.TenantIDContextKey, effectiveTenantID)
+
+	// Single batch fetch to validate that every id exists and belongs to the
+	// requested KB. The service-layer DeleteKnowledgeList only enforces tenant
+	// scope, not KB scope, so the handler must guard against cross-KB deletion.
+	knowledgeList, err := h.kgService.GetKnowledgeBatch(ctx, effectiveTenantID, ids)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, nil)
+		c.Error(errors.NewInternalServerError(err.Error()))
+		return
+	}
+	if len(knowledgeList) != len(ids) {
+		c.Error(errors.NewBadRequestError("One or more knowledge entries not found"))
+		return
+	}
+	for _, k := range knowledgeList {
+		if k.KnowledgeBaseID != kbID {
+			c.Error(errors.NewBadRequestError(
+				fmt.Sprintf("Knowledge %s does not belong to knowledge base %s",
+					secutils.SanitizeForLog(k.ID), secutils.SanitizeForLog(kbID))))
+			return
+		}
+	}
+
+	taskID, err := h.enqueueKnowledgeListDelete(ctx, effectiveTenantID, ids)
+	if err != nil {
+		logger.Errorf(ctx, "Failed to enqueue batch knowledge delete task: %v", err)
+		c.Error(errors.NewInternalServerError("Failed to enqueue batch delete task"))
+		return
+	}
+
+	logger.Infof(ctx, "Batch knowledge delete task enqueued: %s, kb_id: %s, count: %d",
+		taskID, secutils.SanitizeForLog(kbID), len(ids))
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Batch delete task submitted",
+		"data": gin.H{
+			"task_id":       taskID,
+			"deleted_count": len(ids),
+		},
+	})
+}
+
 // ClearKnowledgeBaseContents godoc
 // @Summary      清空知识库内容
 // @Description  删除知识库下的所有知识条目（异步任务）。知识库本身保留，仅清空其中的内容
@@ -681,20 +812,7 @@ func (h *KnowledgeHandler) ClearKnowledgeBaseContents(c *gin.Context) {
 		knowledgeIDs = append(knowledgeIDs, knowledge.ID)
 	}
 
-	payload := types.KnowledgeListDeletePayload{
-		TenantID:     effectiveTenantID,
-		KnowledgeIDs: knowledgeIDs,
-	}
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		logger.Errorf(ctx, "Failed to marshal knowledge list delete payload: %v", err)
-		c.Error(errors.NewInternalServerError("Failed to create cleanup task"))
-		return
-	}
-
-	task := asynq.NewTask(types.TypeKnowledgeListDelete, payloadBytes,
-		asynq.Queue("low"), asynq.MaxRetry(3))
-	info, err := h.asynqClient.Enqueue(task)
+	taskID, err := h.enqueueKnowledgeListDelete(ctx, effectiveTenantID, knowledgeIDs)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to enqueue knowledge list delete task: %v", err)
 		c.Error(errors.NewInternalServerError("Failed to enqueue cleanup task"))
@@ -702,7 +820,7 @@ func (h *KnowledgeHandler) ClearKnowledgeBaseContents(c *gin.Context) {
 	}
 
 	logger.Infof(ctx, "Knowledge base contents clear task enqueued: %s, kb_id: %s, count: %d",
-		info.ID, secutils.SanitizeForLog(kbID), len(knowledgeIDs))
+		taskID, secutils.SanitizeForLog(kbID), len(knowledgeIDs))
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
@@ -913,6 +1031,10 @@ func (h *KnowledgeHandler) GetKnowledgeBatch(c *gin.Context) {
 		return
 	}
 
+	// agentAllowedKBIDs restricts results to the agent's configured KB scope.
+	// nil = no agent restriction; empty slice = agent has no KB access (none mode).
+	var agentAllowedKBIDs []string
+
 	// Optional agent_id: when using shared agent, resolve agent and use its tenant for batch retrieval (so shared KB files can be loaded after refresh)
 	if agentID := secutils.SanitizeForLog(req.AgentID); agentID != "" && h.agentShareService != nil {
 		userIDVal, ok := c.Get(types.UserIDContextKey.String())
@@ -933,12 +1055,21 @@ func (h *KnowledgeHandler) GetKnowledgeBatch(c *gin.Context) {
 			return
 		}
 		effectiveTenantID = agent.TenantID
-		logger.Infof(ctx, "Batch retrieving knowledge with agent_id, effective tenant ID: %d, IDs count: %d",
-			effectiveTenantID, len(req.IDs))
+		agentAllowedKBIDs = resolveAgentAllowedKBIDs(agent)
+
+		if agentAllowedKBIDs != nil && len(agentAllowedKBIDs) == 0 {
+			c.JSON(http.StatusOK, gin.H{"success": true, "data": []*types.Knowledge{}})
+			return
+		}
+		logger.Infof(ctx, "Batch retrieving knowledge with agent_id, effective tenant ID: %d, IDs count: %d, allowed KBs: %v",
+			effectiveTenantID, len(req.IDs), agentAllowedKBIDs)
 	}
 
 	var knowledges []*types.Knowledge
 	var err error
+
+	// scopeKBID tracks the single KB the results must belong to (set by explicit kb_id).
+	var scopeKBID string
 
 	// Optional kb_id: validate KB access and use effective tenant for shared KB
 	if kbID := secutils.SanitizeForLog(req.KBID); kbID != "" {
@@ -947,6 +1078,11 @@ func (h *KnowledgeHandler) GetKnowledgeBatch(c *gin.Context) {
 			c.Error(err)
 			return
 		}
+		if agentAllowedKBIDs != nil && !sliceContains(agentAllowedKBIDs, kbID) {
+			c.Error(errors.NewForbiddenError("Knowledge base not accessible through this agent"))
+			return
+		}
+		scopeKBID = kbID
 		effectiveTenantID = effID
 		ctx = context.WithValue(ctx, types.TenantIDContextKey, effectiveTenantID)
 
@@ -960,6 +1096,28 @@ func (h *KnowledgeHandler) GetKnowledgeBatch(c *gin.Context) {
 			effectiveTenantID, len(req.IDs))
 
 		knowledges, err = h.kgService.GetKnowledgeBatchWithSharedAccess(ctx, effectiveTenantID, req.IDs)
+	}
+
+	// Build the effective allowed-KB set from both scopeKBID and agentAllowedKBIDs.
+	// scopeKBID (from explicit kb_id) restricts to a single KB;
+	// agentAllowedKBIDs (from shared agent) restricts to the agent's configured KBs.
+	var allowedKBSet map[string]bool
+	if scopeKBID != "" {
+		allowedKBSet = map[string]bool{scopeKBID: true}
+	} else if agentAllowedKBIDs != nil {
+		allowedKBSet = make(map[string]bool, len(agentAllowedKBIDs))
+		for _, id := range agentAllowedKBIDs {
+			allowedKBSet[id] = true
+		}
+	}
+	if allowedKBSet != nil && len(knowledges) > 0 {
+		filtered := make([]*types.Knowledge, 0, len(knowledges))
+		for _, k := range knowledges {
+			if allowedKBSet[k.KnowledgeBaseID] {
+				filtered = append(filtered, k)
+			}
+		}
+		knowledges = filtered
 	}
 
 	if err != nil {
@@ -1171,7 +1329,8 @@ func (h *KnowledgeHandler) UpdateKnowledgeTagBatch(c *gin.Context) {
 		c.Error(errors.NewBadRequestError("请求参数不合法").WithDetails(err.Error()))
 		return
 	}
-	// Resolve effective tenant: explicit kb_id, or infer from first knowledge ID (for shared KB when frontend doesn't send kb_id)
+	// Resolve effective tenant and the authorized KB scope.
+	var authorizedKBID string
 	if kbID := secutils.SanitizeForLog(req.KBID); kbID != "" {
 		_, _, effID, permission, err := h.validateKnowledgeBaseAccessWithKBID(c, kbID)
 		if err != nil {
@@ -1182,6 +1341,7 @@ func (h *KnowledgeHandler) UpdateKnowledgeTagBatch(c *gin.Context) {
 			c.Error(errors.NewForbiddenError("No permission to update knowledge tags"))
 			return
 		}
+		authorizedKBID = kbID
 		ctx = context.WithValue(ctx, types.TenantIDContextKey, effID)
 	} else if len(req.Updates) > 0 {
 		// No kb_id: infer from first knowledge ID so shared-KB updates work without client sending kb_id
@@ -1191,15 +1351,16 @@ func (h *KnowledgeHandler) UpdateKnowledgeTagBatch(c *gin.Context) {
 			break
 		}
 		if firstKnowledgeID != "" {
-			_, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, firstKnowledgeID, types.OrgRoleEditor)
+			knowledge, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, firstKnowledgeID, types.OrgRoleEditor)
 			if err != nil {
 				c.Error(err)
 				return
 			}
+			authorizedKBID = knowledge.KnowledgeBaseID
 			ctx = effCtx
 		}
 	}
-	if err := h.kgService.UpdateKnowledgeTagBatch(ctx, req.Updates); err != nil {
+	if err := h.kgService.UpdateKnowledgeTagBatch(ctx, authorizedKBID, req.Updates); err != nil {
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(err)
 		return
@@ -1354,10 +1515,25 @@ func (h *KnowledgeHandler) SearchKnowledge(c *gin.Context) {
 				c.Error(errors.NewInternalServerError("Failed to list knowledge bases").WithDetails(err.Error()))
 				return
 			}
+			// `all` mode: authoritative server-side capability filter. Mirrors the
+			// logic in ListKnowledgeBases so @file search, KB listing, and runtime
+			// all agree on what "mode=all" actually means for this agent.
+			filter := tools.DeriveKBFilterFromTools(agent.Config.AllowedTools)
+			removed := 0
 			for _, kb := range kbs {
-				if kb != nil && kb.Type == types.KnowledgeBaseTypeDocument {
-					scopes = append(scopes, types.KnowledgeSearchScope{TenantID: sourceTenantID, KBID: kb.ID})
+				if kb == nil || kb.Type != types.KnowledgeBaseTypeDocument {
+					continue
 				}
+				if !filter.IsEmpty() && !tools.KBSatisfiesToolRequirements(kb.Capabilities(), agent.Config.AllowedTools) {
+					removed++
+					continue
+				}
+				scopes = append(scopes, types.KnowledgeSearchScope{TenantID: sourceTenantID, KBID: kb.ID})
+			}
+			if removed > 0 {
+				logger.Infof(ctx,
+					"SearchKnowledge(agent=%s, mode=all): tool-capability filter removed %d KBs",
+					agentID, removed)
 			}
 		}
 		knowledges, hasMore, err := h.kgService.SearchKnowledgeForScopes(ctx, scopes, keyword, offset, limit, fileTypes)
@@ -1500,6 +1676,7 @@ func (h *KnowledgeHandler) MoveKnowledge(c *gin.Context) {
 		TargetKBID:   req.TargetKBID,
 		Mode:         req.Mode,
 	}
+	langfuse.InjectTracing(ctx, &payload)
 
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
@@ -1570,4 +1747,33 @@ func (h *KnowledgeHandler) GetKnowledgeMoveProgress(c *gin.Context) {
 		"success": true,
 		"data":    progress,
 	})
+}
+
+// resolveAgentAllowedKBIDs returns the set of knowledge base IDs that the
+// shared agent is allowed to access based on its KBSelectionMode config.
+// Returns nil when no restriction applies ("all" mode), or a concrete slice
+// (possibly empty for "none" mode) when the results must be filtered.
+func resolveAgentAllowedKBIDs(agent *types.CustomAgent) []string {
+	switch agent.Config.KBSelectionMode {
+	case "all":
+		return nil
+	case "none":
+		return []string{}
+	case "selected":
+		return agent.Config.KnowledgeBases
+	default:
+		if len(agent.Config.KnowledgeBases) > 0 {
+			return agent.Config.KnowledgeBases
+		}
+		return nil
+	}
+}
+
+func sliceContains(ss []string, target string) bool {
+	for _, s := range ss {
+		if s == target {
+			return true
+		}
+	}
+	return false
 }

@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"log"
@@ -21,10 +22,12 @@ var noAuthAPI = map[string][]string{
 	"/health":                    {"GET"},
 	"/api/v1/auth/register":      {"POST"},
 	"/api/v1/auth/login":         {"POST"},
+	"/api/v1/auth/auto-setup":    {"POST"},
 	"/api/v1/auth/oidc/config":   {"GET"},
 	"/api/v1/auth/oidc/url":      {"GET"},
 	"/api/v1/auth/oidc/callback": {"GET"},
 	"/api/v1/auth/refresh":       {"POST"},
+	"/api/v1/files/presigned":    {"GET"},
 }
 
 // 检查请求是否在无需认证的API列表中
@@ -177,7 +180,7 @@ func Auth(
 				return
 			}
 
-			if t == nil || t.APIKey != apiKey {
+			if t == nil || subtle.ConstantTimeCompare([]byte(t.APIKey), []byte(apiKey)) != 1 {
 				c.JSON(http.StatusUnauthorized, gin.H{
 					"error": "Unauthorized: invalid API key",
 				})

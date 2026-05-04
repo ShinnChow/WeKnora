@@ -12,6 +12,7 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/datasource"
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/hibiken/asynq"
@@ -298,6 +299,7 @@ func (s *DataSourceService) ManualSync(ctx context.Context, dsID string) (*types
 		SyncLogID:    syncLog.ID,
 		ForceFull:    false,
 	}
+	langfuse.InjectTracing(ctx, payload)
 
 	payloadJSON, _ := json.Marshal(payload)
 	task := asynq.NewTask(types.TypeDataSourceSync, payloadJSON)
@@ -513,6 +515,9 @@ func (s *DataSourceService) ProcessSync(ctx context.Context, task *asynq.Task) e
 	for _, item := range items {
 		if item.IsDeleted {
 			if ds.SyncDeletions {
+				// Count only — actual KB deletion is intentionally not performed.
+				// Users manage knowledge removal explicitly via the KB UI to avoid
+				// accidental data loss from connector misdetection or reconfiguration.
 				result.Deleted++
 			}
 			continue

@@ -39,6 +39,10 @@ type RemoteAPIChat struct {
 	baseURL   string
 	apiKey    string
 	provider  provider.ProviderName
+	appID     string
+	appSecret string
+	// customHeaders 为用户在模型配置中指定的自定义 HTTP 请求头（类似 OpenAI Python SDK 的 extra_headers）。
+	customHeaders map[string]string
 
 	// requestCustomizer 允许子类自定义请求
 	// 返回自定义请求体（如果为 nil 则使用标准请求）和是否需要使用原始 HTTP 请求
@@ -47,6 +51,9 @@ type RemoteAPIChat struct {
 	// endpointCustomizer 允许子类自定义请求的 endpoint
 	// 返回是否使用自定义请求地址, 返回空则使用默认OpenAI格式地址
 	endpointCustomizer func(baseURL string, modelID string, isStream bool) (endpoint string)
+
+	// headerCustomizer 允许子类自定义原始 HTTP 请求头（例如签名认证）
+	headerCustomizer func(req *http.Request, body []byte) error
 }
 
 // NewRemoteAPIChat 创建远程 API 聊天实例
@@ -58,23 +65,65 @@ func NewRemoteAPIChat(chatConfig *ChatConfig) (*RemoteAPIChat, error) {
 	}
 
 	apiKey := chatConfig.APIKey
-	config := openai.DefaultConfig(apiKey)
-	if baseURL := chatConfig.BaseURL; baseURL != "" {
-		config.BaseURL = baseURL
-	}
-
 	providerName := provider.ProviderName(chatConfig.Provider)
 	if providerName == "" {
 		providerName = provider.DetectProvider(chatConfig.BaseURL)
 	}
 
+	var config openai.ClientConfig
+	if providerName == provider.ProviderAzureOpenAI {
+		config = openai.DefaultAzureConfig(apiKey, chatConfig.BaseURL)
+		config.AzureModelMapperFunc = func(model string) string {
+			return model
+		}
+		if chatConfig.ExtraConfig != nil {
+			if v, ok := chatConfig.ExtraConfig["api_version"]; ok {
+				config.APIVersion = v
+			}
+		}
+	} else {
+		config = openai.DefaultConfig(apiKey)
+		if baseURL := chatConfig.BaseURL; baseURL != "" {
+			config.BaseURL = baseURL
+		}
+	}
+
+	// 如果指定了 CustomHeaders，则给 SDK 使用的 HTTPClient 挂一层 RoundTripper，
+	// 在每个请求上自动注入这些 header（raw HTTP 路径会在发送前单独处理）。
+	if len(chatConfig.CustomHeaders) > 0 {
+		if httpClient, ok := config.HTTPClient.(*http.Client); ok {
+			config.HTTPClient = secutils.WrapHTTPClientWithHeaders(httpClient, chatConfig.CustomHeaders)
+		} else {
+			// SDK 默认未显式设置时 HTTPClient 为 nil，此时构造一个新的注入了 header 的 client。
+			config.HTTPClient = secutils.WrapHTTPClientWithHeaders(nil, chatConfig.CustomHeaders)
+		}
+	}
+
+	modelName := chatConfig.ModelName
+	if chatConfig.ExtraConfig != nil {
+		if override := strings.TrimSpace(chatConfig.ExtraConfig["remote_model_name"]); override != "" {
+			modelName = override
+		}
+	}
+	if providerName == provider.ProviderWeKnoraCloud {
+		if chatConfig.AppID == "" {
+			return nil, fmt.Errorf("WeKnoraCloud provider: AppID is required")
+		}
+		if chatConfig.AppSecret == "" {
+			return nil, fmt.Errorf("WeKnoraCloud provider: AppSecret is required")
+		}
+	}
+
 	return &RemoteAPIChat{
-		modelName: chatConfig.ModelName,
-		client:    openai.NewClientWithConfig(config),
-		modelID:   chatConfig.ModelID,
-		baseURL:   chatConfig.BaseURL,
-		apiKey:    apiKey,
-		provider:  providerName,
+		modelName:     modelName,
+		client:        openai.NewClientWithConfig(config),
+		modelID:       chatConfig.ModelID,
+		baseURL:       chatConfig.BaseURL,
+		apiKey:        apiKey,
+		provider:      providerName,
+		appID:         chatConfig.AppID,
+		appSecret:     chatConfig.AppSecret,
+		customHeaders: chatConfig.CustomHeaders,
 	}, nil
 }
 
@@ -86,6 +135,11 @@ func (c *RemoteAPIChat) SetRequestCustomizer(customizer func(req *openai.ChatCom
 // SetEndpointCustomizer 设置请求地址自定义器
 func (c *RemoteAPIChat) SetEndpointCustomizer(customizer func(baseURL string, modelID string, isStream bool) string) {
 	c.endpointCustomizer = customizer
+}
+
+// SetHeaderCustomizer 设置原始 HTTP 请求头自定义器
+func (c *RemoteAPIChat) SetHeaderCustomizer(customizer func(req *http.Request, body []byte) error) {
+	c.headerCustomizer = customizer
 }
 
 // ConvertMessages 转换消息格式为 OpenAI 格式（导出供子类使用）
@@ -177,9 +231,7 @@ func (c *RemoteAPIChat) BuildChatCompletionRequest(messages []Message, opts *Cha
 	}
 
 	if opts != nil {
-		if opts.Temperature > 0 {
-			req.Temperature = float32(opts.Temperature)
-		}
+		req.Temperature = float32(opts.Temperature)
 		if opts.TopP > 0 {
 			req.TopP = float32(opts.TopP)
 		}
@@ -217,7 +269,8 @@ func (c *RemoteAPIChat) BuildChatCompletionRequest(messages []Message, opts *Cha
 
 		// 处理 ParallelToolCalls
 		if opts.ParallelToolCalls != nil {
-			req.ParallelToolCalls = *opts.ParallelToolCalls
+			val := *opts.ParallelToolCalls
+			req.ParallelToolCalls = val
 		}
 
 		// 处理 ToolChoice（标准实现）
@@ -274,7 +327,6 @@ func (c *RemoteAPIChat) Chat(ctx context.Context, messages []Message, opts *Chat
 	}
 
 	c.logRequest(ctx, req, false)
-
 	resp, err := c.client.CreateChatCompletion(ctx, req)
 	if err != nil {
 		if isMultimodalNotSupportedError(err) {
@@ -304,20 +356,37 @@ func (c *RemoteAPIChat) chatWithRawHTTP(ctx context.Context, endpoint string, cu
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	logger.Infof(ctx, "[LLM Request] model=%s, raw HTTP request:\n%s", c.modelName, secutils.CompactImageDataURLForLog(string(jsonData)))
 	if endpoint == "" {
 		endpoint = c.baseURL + "/chat/completions"
 	}
 	if err := secutils.ValidateURLForSSRF(endpoint); err != nil {
 		return nil, fmt.Errorf("endpoint SSRF check failed: %w", err)
 	}
+	logger.Infof(ctx, "[LLM Request] Remote HTTP, endpoint=%s, model=%s, raw HTTP request:\n%s",
+		endpoint, c.modelName, secutils.CompactImageDataURLForLog(string(jsonData)))
+
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	if c.headerCustomizer != nil {
+		if err := c.headerCustomizer(httpReq, jsonData); err != nil {
+			return nil, fmt.Errorf("customize headers: %w", err)
+		}
+	} else if c.provider == provider.ProviderAzureOpenAI {
+		httpReq.Header.Set("api-key", c.apiKey)
+	} else {
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	// 注入用户自定义 header（保留头会在工具内部自动跳过）
+	secutils.ApplyCustomHeaders(httpReq, c.customHeaders)
+
+	logger.Infof(ctx, "[LLM Request] Remote HTTP, endpoint=%s, model=%s",
+		endpoint, c.modelName)
 
 	resp, err := rawHTTPClient.Do(httpReq)
 	if err != nil {
@@ -455,13 +524,18 @@ func (c *RemoteAPIChat) chatStreamWithRawHTTP(ctx context.Context, endpoint stri
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	logger.Infof(ctx, "[LLM Stream] model=%s", c.modelName)
-
 	if endpoint == "" {
 		endpoint = c.baseURL + "/chat/completions"
 	}
 	if err := secutils.ValidateURLForSSRF(endpoint); err != nil {
 		return nil, fmt.Errorf("endpoint SSRF check failed: %w", err)
+	}
+
+	if prettyJSON, pErr := json.MarshalIndent(customReq, "", "  "); pErr == nil {
+		logger.Infof(ctx, "[LLM Stream Request] endpoint=%s, model=%s, stream=true, request:\n%s",
+			endpoint, c.modelName, secutils.CompactImageDataURLForLog(string(prettyJSON)))
+	} else {
+		logger.Infof(ctx, "[LLM Stream] endpoint=%s, model=%s", endpoint, c.modelName)
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer(jsonData))
 	if err != nil {
@@ -469,8 +543,20 @@ func (c *RemoteAPIChat) chatStreamWithRawHTTP(ctx context.Context, endpoint stri
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	if c.headerCustomizer != nil {
+		if err := c.headerCustomizer(httpReq, jsonData); err != nil {
+			return nil, fmt.Errorf("customize headers: %w", err)
+		}
+	} else if c.provider == provider.ProviderAzureOpenAI {
+		httpReq.Header.Set("api-key", c.apiKey)
+	} else {
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
 	httpReq.Header.Set("Accept", "text/event-stream")
+
+	// 注入用户自定义 header（保留头会在工具内部自动跳过）
+	secutils.ApplyCustomHeaders(httpReq, c.customHeaders)
 
 	resp, err := rawHTTPClient.Do(httpReq)
 	if err != nil {
@@ -505,11 +591,12 @@ func (c *RemoteAPIChat) processStream(ctx context.Context, stream *openai.ChatCo
 					logger.Infof(ctx, "[LLM Usage] model=%s, prompt_tokens=%d, completion_tokens=%d, total_tokens=%d",
 						c.modelName, state.usage.PromptTokens, state.usage.CompletionTokens, state.usage.TotalTokens)
 				}
+				toolCalls := state.buildOrderedToolCalls()
 				streamChan <- types.StreamResponse{
 					ResponseType: types.ResponseTypeAnswer,
 					Content:      "",
 					Done:         true,
-					ToolCalls:    state.buildOrderedToolCalls(),
+					ToolCalls:    toolCalls,
 					Usage:        state.usage,
 					FinishReason: state.lastFinishReason,
 				}
@@ -548,7 +635,20 @@ func (c *RemoteAPIChat) processRawHTTPStream(ctx context.Context, resp *http.Res
 	for {
 		event, err := reader.ReadEvent()
 		if err != nil {
-			if err != io.EOF {
+			if err == io.EOF {
+				if state.usage != nil {
+					logger.Infof(ctx, "[LLM Usage] model=%s, prompt_tokens=%d, completion_tokens=%d, total_tokens=%d",
+						c.modelName, state.usage.PromptTokens, state.usage.CompletionTokens, state.usage.TotalTokens)
+				}
+				toolCalls := state.buildOrderedToolCalls()
+				streamChan <- types.StreamResponse{
+					ResponseType: types.ResponseTypeAnswer,
+					Content:      "",
+					Done:         true,
+					ToolCalls:    toolCalls,
+					Usage:        state.usage,
+				}
+			} else {
 				logger.Errorf(ctx, "Stream read error: %v", err)
 				streamChan <- types.StreamResponse{
 					ResponseType: types.ResponseTypeError,
@@ -568,11 +668,12 @@ func (c *RemoteAPIChat) processRawHTTPStream(ctx context.Context, resp *http.Res
 				logger.Infof(ctx, "[LLM Usage] model=%s, prompt_tokens=%d, completion_tokens=%d, total_tokens=%d",
 					c.modelName, state.usage.PromptTokens, state.usage.CompletionTokens, state.usage.TotalTokens)
 			}
+			toolCalls := state.buildOrderedToolCalls()
 			streamChan <- types.StreamResponse{
 				ResponseType: types.ResponseTypeAnswer,
 				Content:      "",
 				Done:         true,
-				ToolCalls:    state.buildOrderedToolCalls(),
+				ToolCalls:    toolCalls,
 				Usage:        state.usage,
 			}
 			return
@@ -769,7 +870,11 @@ func (c *RemoteAPIChat) processToolCallsDelta(ctx context.Context, toolCalls []o
 			toolCallEntry.Type = string(tc.Type)
 		}
 		if tc.Function.Name != "" {
-			toolCallEntry.Function.Name += tc.Function.Name
+			// 防御性校验：解决部分供应商（如vLLM Ascend等）在每个流 Chunk 中重复发送完整工具名的问题。
+			// 如果当前已存名字与新收到名字一致，则视为冗余重复，不进行叠加。
+			if toolCallEntry.Function.Name != tc.Function.Name {
+				toolCallEntry.Function.Name += tc.Function.Name
+			}
 		}
 
 		argsUpdated := false

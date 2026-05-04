@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { MessagePlugin } from 'tdesign-vue-next'
 import ManualKnowledgeEditor from '@/components/manual-knowledge-editor.vue'
 import { useAuthStore } from '@/stores/auth'
+import { useSettingsStore } from '@/stores/settings'
+import { getCurrentUser } from '@/api/auth'
 
 // TDesign locale configs
 import enUSConfig from 'tdesign-vue-next/esm/locale/en_US'
@@ -15,6 +17,7 @@ import ruRUConfig from 'tdesign-vue-next/esm/locale/ru_RU'
 const { locale } = useI18n()
 const router = useRouter()
 const authStore = useAuthStore()
+const settingsStore = useSettingsStore()
 
 const tdLocaleMap: Record<string, object> = {
   'en-US': enUSConfig,
@@ -37,31 +40,51 @@ const clearOIDCCallbackState = (path = '/') => {
   window.history.replaceState({}, document.title, path)
 }
 
-const persistOIDCLoginResponse = async (response: any) => {
-  if (response.user && response.tenant && response.token) {
-    authStore.setUser({
-      id: response.user.id || '',
-      username: response.user.username || '',
-      email: response.user.email || '',
-      avatar: response.user.avatar,
-      tenant_id: String(response.tenant.id) || '',
-      can_access_all_tenants: response.user.can_access_all_tenants || false,
-      created_at: response.user.created_at || new Date().toISOString(),
-      updated_at: response.user.updated_at || new Date().toISOString()
-    })
-    authStore.setToken(response.token)
-    if (response.refresh_token) {
-      authStore.setRefreshToken(response.refresh_token)
-    }
+const syncOIDCUserContext = async () => {
+  const currentUserResponse = await getCurrentUser()
+  if (!currentUserResponse.success || !currentUserResponse.data?.user) {
+    throw new Error(currentUserResponse.message || 'Failed to get user information')
+  }
+
+  const { user, tenant } = currentUserResponse.data
+  authStore.setUser({
+    id: user.id || '',
+    username: user.username || '',
+    email: user.email || '',
+    avatar: user.avatar,
+    tenant_id: String(user.tenant_id || tenant?.id || ''),
+    can_access_all_tenants: user.can_access_all_tenants || false,
+    created_at: user.created_at || new Date().toISOString(),
+    updated_at: user.updated_at || new Date().toISOString()
+  })
+  if (tenant) {
     authStore.setTenant({
-      id: String(response.tenant.id) || '',
-      name: response.tenant.name || '',
-      api_key: response.tenant.api_key || '',
-      owner_id: response.user.id || '',
-      created_at: response.tenant.created_at || new Date().toISOString(),
-      updated_at: response.tenant.updated_at || new Date().toISOString()
+      id: String(tenant.id) || '',
+      name: tenant.name || '',
+      api_key: tenant.api_key || '',
+      owner_id: tenant.owner_id || user.id || '',
+      description: tenant.description,
+      status: tenant.status,
+      business: tenant.business,
+      storage_quota: tenant.storage_quota,
+      storage_used: tenant.storage_used,
+      created_at: tenant.created_at || new Date().toISOString(),
+      updated_at: tenant.updated_at || new Date().toISOString()
     })
   }
+}
+
+const persistOIDCLoginResponse = async (response: any) => {
+  if (!response.token) {
+    throw new Error(response.message || 'OIDC login failed')
+  }
+
+  authStore.setToken(response.token)
+  if (response.refresh_token) {
+    authStore.setRefreshToken(response.refresh_token)
+  }
+
+  await syncOIDCUserContext()
 
   await nextTick()
   router.replace('/platform/knowledge-bases')
@@ -106,15 +129,47 @@ const handleGlobalOIDCCallback = async () => {
     MessagePlugin.error(response.message || 'OIDC login failed')
   } catch (error: any) {
     console.error('Global OIDC callback handling failed:', error)
+    authStore.logout()
     clearOIDCCallbackState('/login')
     await router.replace('/login')
     MessagePlugin.error(error.message || 'OIDC login failed')
   }
 }
 
+let updateCheckTimer: ReturnType<typeof setInterval> | null = null
+
 onMounted(() => {
   handleGlobalOIDCCallback()
+
+  // Auto check for updates on startup
+  setTimeout(() => {
+    if (settingsStore.isAutoCheckUpdateEnabled) {
+      // @ts-ignore
+      if (window.go && window.go.main && window.go.main.App && window.go.main.App.AutoCheckForUpdates) {
+        // @ts-ignore
+        window.go.main.App.AutoCheckForUpdates()
+      }
+    }
+  }, 2000)
+
+  // Periodically check for updates (every 4 hours)
+  updateCheckTimer = setInterval(() => {
+    if (settingsStore.isAutoCheckUpdateEnabled) {
+      // @ts-ignore
+      if (window.go && window.go.main && window.go.main.App && window.go.main.App.AutoCheckForUpdates) {
+        // @ts-ignore
+        window.go.main.App.AutoCheckForUpdates()
+      }
+    }
+  }, 4 * 60 * 60 * 1000)
 })
+
+onUnmounted(() => {
+  if (updateCheckTimer) {
+    clearInterval(updateCheckTimer)
+  }
+})
+
 </script>
 <template>
   <t-config-provider :globalConfig="tdGlobalConfig">
@@ -125,6 +180,11 @@ onMounted(() => {
   </t-config-provider>
 </template>
 <style>
+html {
+    /* 提示 UA 使用对应配色绘制滚动条等，减少主题切换时的额外重绘 */
+    color-scheme: light dark;
+}
+
 body,
 html,
 #app {
@@ -139,5 +199,12 @@ html,
     -moz-osx-font-smoothing: grayscale;
     background: var(--td-bg-color-page);
     color: var(--td-text-color-primary);
+}
+
+#app {
+    /* 独立合成层，减轻 WebKit 全量重绘时整窗与内容的撕裂感（桌面 WebView 尤其明显） */
+    isolation: isolate;
+    transform: translateZ(0);
+    backface-visibility: hidden;
 }
 </style>

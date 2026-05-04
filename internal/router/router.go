@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,8 +22,10 @@ import (
 	"github.com/Tencent/WeKnora/internal/handler/session"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/middleware"
+	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	secutils "github.com/Tencent/WeKnora/internal/utils"
 
 	_ "github.com/Tencent/WeKnora/docs" // swagger docs
 )
@@ -31,36 +34,40 @@ import (
 type RouterParams struct {
 	dig.In
 
-	Config                *config.Config
-	UserService           interfaces.UserService
-	KBService             interfaces.KnowledgeBaseService
-	KnowledgeService      interfaces.KnowledgeService
-	ChunkService          interfaces.ChunkService
-	SessionService        interfaces.SessionService
-	MessageService        interfaces.MessageService
-	ModelService          interfaces.ModelService
-	EvaluationService     interfaces.EvaluationService
-	KBHandler             *handler.KnowledgeBaseHandler
-	KnowledgeHandler      *handler.KnowledgeHandler
-	TenantHandler         *handler.TenantHandler
-	TenantService         interfaces.TenantService
-	ChunkHandler          *handler.ChunkHandler
-	SessionHandler        *session.Handler
-	MessageHandler        *handler.MessageHandler
-	ModelHandler          *handler.ModelHandler
-	EvaluationHandler     *handler.EvaluationHandler
-	AuthHandler           *handler.AuthHandler
-	InitializationHandler *handler.InitializationHandler
-	SystemHandler         *handler.SystemHandler
-	MCPServiceHandler     *handler.MCPServiceHandler
-	WebSearchHandler      *handler.WebSearchHandler
-	FAQHandler            *handler.FAQHandler
-	TagHandler            *handler.TagHandler
-	CustomAgentHandler    *handler.CustomAgentHandler
-	SkillHandler          *handler.SkillHandler
-	OrganizationHandler   *handler.OrganizationHandler
-	IMHandler             *handler.IMHandler
-	DataSourceHandler     *handler.DataSourceHandler
+	Config                   *config.Config
+	UserService              interfaces.UserService
+	KBService                interfaces.KnowledgeBaseService
+	KnowledgeService         interfaces.KnowledgeService
+	ChunkService             interfaces.ChunkService
+	SessionService           interfaces.SessionService
+	MessageService           interfaces.MessageService
+	ModelService             interfaces.ModelService
+	EvaluationService        interfaces.EvaluationService
+	KBHandler                *handler.KnowledgeBaseHandler
+	KnowledgeHandler         *handler.KnowledgeHandler
+	TenantHandler            *handler.TenantHandler
+	TenantService            interfaces.TenantService
+	ChunkHandler             *handler.ChunkHandler
+	SessionHandler           *session.Handler
+	MessageHandler           *handler.MessageHandler
+	ModelHandler             *handler.ModelHandler
+	EvaluationHandler        *handler.EvaluationHandler
+	AuthHandler              *handler.AuthHandler
+	InitializationHandler    *handler.InitializationHandler
+	SystemHandler            *handler.SystemHandler
+	MCPServiceHandler        *handler.MCPServiceHandler
+	WebSearchHandler         *handler.WebSearchHandler
+	WebSearchProviderHandler *handler.WebSearchProviderHandler
+	VectorStoreHandler       *handler.VectorStoreHandler
+	FAQHandler               *handler.FAQHandler
+	TagHandler               *handler.TagHandler
+	CustomAgentHandler       *handler.CustomAgentHandler
+	SkillHandler             *handler.SkillHandler
+	OrganizationHandler      *handler.OrganizationHandler
+	IMHandler                *handler.IMHandler
+	DataSourceHandler        *handler.DataSourceHandler
+	WeKnoraCloudHandler      *handler.WeKnoraCloudHandler
+	WikiPageHandler          *handler.WikiPageHandler
 }
 
 // NewRouter 创建新的路由
@@ -115,8 +122,15 @@ func NewRouter(params RouterParams) *gin.Engine {
 	// 文件服务：统一代理本地/MinIO/COS/TOS存储后端（需要认证）
 	serveFiles(r)
 
+	// Presigned file access: no auth required, signature-verified.
+	servePresignedFiles(r, params.TenantService)
+
 	// 添加OpenTelemetry追踪中间件
 	// r.Use(middleware.TracingMiddleware())
+
+	// Langfuse observability — only active when LANGFUSE_* env vars are set.
+	// The middleware is registered unconditionally; when disabled it's a no-op.
+	r.Use(langfuse.GinMiddleware())
 
 	// 需要认证的API路由
 	v1 := r.Group("/api/v1")
@@ -137,11 +151,15 @@ func NewRouter(params RouterParams) *gin.Engine {
 		RegisterSystemRoutes(v1, params.SystemHandler)
 		RegisterMCPServiceRoutes(v1, params.MCPServiceHandler)
 		RegisterWebSearchRoutes(v1, params.WebSearchHandler)
+		RegisterWebSearchProviderRoutes(v1, params.WebSearchProviderHandler)
+		RegisterVectorStoreRoutes(v1, params.VectorStoreHandler)
 		RegisterCustomAgentRoutes(v1, params.CustomAgentHandler)
 		RegisterSkillRoutes(v1, params.SkillHandler)
 		RegisterOrganizationRoutes(v1, params.OrganizationHandler)
 		RegisterIMChannelRoutes(v1, params.IMHandler)
 		RegisterDataSourceRoutes(v1, params.DataSourceHandler)
+		RegisterWeKnoraCloudRoutes(v1, params.WeKnoraCloudHandler)
+		RegisterWikiPageRoutes(v1, params.WikiPageHandler)
 	}
 
 	return r
@@ -209,6 +227,8 @@ func RegisterKnowledgeRoutes(r *gin.RouterGroup, handler *handler.KnowledgeHandl
 		k.PUT("/tags", handler.UpdateKnowledgeTagBatch)
 		// 搜索知识
 		k.GET("/search", handler.SearchKnowledge)
+		// 批量删除知识（同一知识库内）
+		k.POST("/batch-delete", handler.BatchDeleteKnowledge)
 		// 移动知识到其他知识库
 		k.POST("/move", handler.MoveKnowledge)
 		// 获取知识移动进度
@@ -316,6 +336,12 @@ func RegisterSessionRoutes(r *gin.RouterGroup, handler *session.Handler) {
 		sessions.DELETE("/:id/messages", handler.ClearSessionMessages)
 		sessions.POST("/:session_id/generate_title", handler.GenerateTitle)
 		sessions.POST("/:session_id/stop", handler.StopSession)
+		// POST and DELETE share this path but gin maintains a separate radix tree
+		// per HTTP verb, and the existing trees use different wildcard names
+		// (POST uses :session_id, DELETE uses :id). Use whatever matches each
+		// tree to avoid "wildcard conflicts" panic at route registration.
+		sessions.POST("/:session_id/pin", handler.PinSession)
+		sessions.DELETE("/:id/pin", handler.UnpinSession)
 		// 继续接收活跃流
 		sessions.GET("/continue-stream/:session_id", handler.ContinueStream)
 	}
@@ -354,6 +380,7 @@ func RegisterTenantRoutes(r *gin.RouterGroup, handler *handler.TenantHandler) {
 		tenantRoutes.GET("/:id", handler.GetTenant)
 		tenantRoutes.PUT("/:id", handler.UpdateTenant)
 		tenantRoutes.DELETE("/:id", handler.DeleteTenant)
+		tenantRoutes.POST("/:id/api-key", handler.ResetAPIKey)
 		tenantRoutes.GET("", handler.ListTenants)
 
 		// Generic KV configuration management (tenant-level)
@@ -395,6 +422,7 @@ func RegisterEvaluationRoutes(r *gin.RouterGroup, handler *handler.EvaluationHan
 func RegisterAuthRoutes(r *gin.RouterGroup, handler *handler.AuthHandler) {
 	r.POST("/auth/register", handler.Register)
 	r.POST("/auth/login", handler.Login)
+	r.POST("/auth/auto-setup", handler.AutoSetup)
 	r.GET("/auth/oidc/config", handler.GetOIDCConfig)
 	r.GET("/auth/oidc/url", handler.GetOIDCAuthorizationURL)
 	r.GET("/auth/oidc/callback", handler.OIDCRedirectCallback)
@@ -423,6 +451,7 @@ func RegisterInitializationRoutes(r *gin.RouterGroup, handler *handler.Initializ
 	r.POST("/initialization/remote/check", handler.CheckRemoteModel)
 	r.POST("/initialization/embedding/test", handler.TestEmbeddingModel)
 	r.POST("/initialization/rerank/check", handler.CheckRerankModel)
+	r.POST("/initialization/asr/check", handler.CheckASRModel)
 	r.POST("/initialization/multimodal/test", handler.TestMultimodalFunction)
 
 	r.POST("/initialization/extract/text-relation", handler.ExtractTextRelations)
@@ -440,7 +469,6 @@ func RegisterSystemRoutes(r *gin.RouterGroup, handler *handler.SystemHandler) {
 		systemRoutes.POST("/docreader/reconnect", handler.ReconnectDocReader)
 		systemRoutes.GET("/storage-engine-status", handler.GetStorageEngineStatus)
 		systemRoutes.POST("/storage-engine-check", handler.CheckStorageEngine)
-		systemRoutes.GET("/minio/buckets", handler.ListMinioBuckets)
 	}
 }
 
@@ -477,12 +505,52 @@ func RegisterWebSearchRoutes(r *gin.RouterGroup, webSearchHandler *handler.WebSe
 	}
 }
 
+// RegisterWebSearchProviderRoutes registers CRUD routes for web search provider configurations
+func RegisterWebSearchProviderRoutes(r *gin.RouterGroup, h *handler.WebSearchProviderHandler) {
+	providers := r.Group("/web-search-providers")
+	{
+		// List available provider types (metadata for UI forms)
+		providers.GET("/types", h.ListProviderTypes)
+		// Test with raw credentials (no persistence)
+		providers.POST("/test", h.TestProviderRaw)
+		// CRUD
+		providers.POST("", h.CreateProvider)
+		providers.GET("", h.ListProviders)
+		providers.GET("/:id", h.GetProvider)
+		providers.PUT("/:id", h.UpdateProvider)
+		providers.DELETE("/:id", h.DeleteProvider)
+		// Test existing saved provider
+		providers.POST("/:id/test", h.TestProviderByID)
+	}
+}
+
+// RegisterVectorStoreRoutes registers CRUD routes for vector store configurations
+func RegisterVectorStoreRoutes(r *gin.RouterGroup, h *handler.VectorStoreHandler) {
+	stores := r.Group("/vector-stores")
+	{
+		// List available engine types (metadata for UI forms)
+		stores.GET("/types", h.ListStoreTypes)
+		// Test with raw credentials (no persistence)
+		stores.POST("/test", h.TestStoreRaw)
+		// CRUD
+		stores.POST("", h.CreateStore)
+		stores.GET("", h.ListStores)
+		stores.GET("/:id", h.GetStore)
+		stores.PUT("/:id", h.UpdateStore)
+		stores.DELETE("/:id", h.DeleteStore)
+		// Test existing saved or env store
+		stores.POST("/:id/test", h.TestStoreByID)
+	}
+}
+
 // RegisterCustomAgentRoutes registers custom agent routes
 func RegisterCustomAgentRoutes(r *gin.RouterGroup, agentHandler *handler.CustomAgentHandler) {
 	agents := r.Group("/agents")
 	{
 		// Get placeholder definitions (must be before /:id to avoid conflict)
 		agents.GET("/placeholders", agentHandler.GetPlaceholders)
+		// List smart-reasoning agent type presets (rag-qa / wiki-qa / hybrid / custom)
+		agents.GET("/type-presets", agentHandler.GetAgentTypePresets)
 		// Create custom agent
 		agents.POST("", agentHandler.CreateAgent)
 		// List all agents (including built-in)
@@ -614,9 +682,17 @@ func RegisterIMChannelRoutes(r *gin.RouterGroup, imHandler *handler.IMHandler) {
 	// Channel operations by channel ID
 	channels := r.Group("/im-channels")
 	{
+		channels.GET("", imHandler.ListAllIMChannels)
 		channels.PUT("/:id", imHandler.UpdateIMChannel)
 		channels.DELETE("/:id", imHandler.DeleteIMChannel)
 		channels.POST("/:id/toggle", imHandler.ToggleIMChannel)
+	}
+
+	// WeChat QR code login (requires authentication)
+	wechatGroup := r.Group("/wechat")
+	{
+		wechatGroup.POST("/qrcode", imHandler.WeChatGetQRCode)
+		wechatGroup.POST("/qrcode/status", imHandler.WeChatPollQRCodeStatus)
 	}
 }
 
@@ -743,6 +819,97 @@ func serveFiles(r *gin.Engine) {
 	})
 }
 
+// servePresignedFiles serves files via HMAC-signed URLs without requiring authentication.
+// This is used by IM channels to serve images that are embedded in bot replies.
+//
+// Route:
+//   - /api/v1/files/presigned?file_path=<provider://...>&tenant_id=<id>&expires=<unix>&sig=<hmac>
+func servePresignedFiles(r *gin.Engine, tenantService interfaces.TenantService) {
+	baseDir := os.Getenv("LOCAL_STORAGE_BASE_DIR")
+	if baseDir == "" {
+		baseDir = "/data/files"
+	}
+	absDir, _ := filepath.Abs(baseDir)
+
+	r.GET("/api/v1/files/presigned", func(c *gin.Context) {
+		filePath := strings.TrimSpace(c.Query("file_path"))
+		tenantIDStr := strings.TrimSpace(c.Query("tenant_id"))
+		expiresStr := strings.TrimSpace(c.Query("expires"))
+		sig := strings.TrimSpace(c.Query("sig"))
+
+		if filePath == "" || tenantIDStr == "" || expiresStr == "" || sig == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "missing required parameters"})
+			return
+		}
+		if strings.Contains(filePath, "..") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid file path"})
+			return
+		}
+
+		tenantID, err := strconv.ParseUint(tenantIDStr, 10, 64)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tenant_id"})
+			return
+		}
+
+		// Verify HMAC signature and expiry.
+		if !secutils.VerifyFileURLSig(filePath, tenantID, expiresStr, sig) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "invalid or expired signature"})
+			return
+		}
+
+		// Resolve the file service for this tenant.
+		provider := types.ParseProviderScheme(filePath)
+		tenant, err := tenantService.GetTenantByID(c.Request.Context(), tenantID)
+		if err != nil {
+			logger.Warnf(context.Background(), "[Router] /files/presigned tenant lookup failed: tenant_id=%d err=%v", tenantID, err)
+			c.Status(http.StatusNotFound)
+			return
+		}
+
+		fileSvc, resolvedProvider, err := filesvc.NewFileServiceFromStorageConfig(provider, tenant.StorageEngineConfig, absDir)
+		if err != nil {
+			logger.Warnf(context.Background(), "[Router] /files/presigned resolve file service failed: tenant_id=%d provider=%s err=%v", tenantID, provider, err)
+			c.Status(http.StatusBadRequest)
+			return
+		}
+
+		reader, err := fileSvc.GetFile(c.Request.Context(), filePath)
+		if err != nil {
+			logger.Warnf(context.Background(), "[Router] /files/presigned get file failed: tenant_id=%d provider=%s path=%q err=%v", tenantID, resolvedProvider, filePath, err)
+			c.Status(http.StatusNotFound)
+			return
+		}
+		defer reader.Close()
+
+		ext := filepath.Ext(filePath)
+		contentType := "application/octet-stream"
+		switch strings.ToLower(ext) {
+		case ".png":
+			contentType = "image/png"
+		case ".jpg", ".jpeg":
+			contentType = "image/jpeg"
+		case ".gif":
+			contentType = "image/gif"
+		case ".webp":
+			contentType = "image/webp"
+		case ".bmp":
+			contentType = "image/bmp"
+		case ".svg":
+			contentType = "image/svg+xml"
+		case ".pdf":
+			contentType = "application/pdf"
+		}
+
+		c.Header("Content-Type", contentType)
+		c.Header("Cache-Control", "public, max-age=86400")
+		c.Status(http.StatusOK)
+		if _, err := io.Copy(c.Writer, reader); err != nil {
+			logger.Warnf(context.Background(), "[Router] /files/presigned write response failed: %v", err)
+		}
+	})
+}
+
 // RegisterDataSourceRoutes 注册数据源相关的路由
 func RegisterDataSourceRoutes(r *gin.RouterGroup, handler *handler.DataSourceHandler) {
 	// Data source routes
@@ -773,5 +940,42 @@ func RegisterDataSourceRoutes(r *gin.RouterGroup, handler *handler.DataSourceHan
 		// Sync logs
 		ds.GET("/:id/logs", handler.GetSyncLogs)
 		ds.GET("/logs/:log_id", handler.GetSyncLog)
+	}
+}
+
+// RegisterWeKnoraCloudRoutes 注册 WeKnoraCloud 初始化路由
+func RegisterWeKnoraCloudRoutes(r *gin.RouterGroup, handler *handler.WeKnoraCloudHandler) {
+	r.POST("/weknoracloud/credentials", handler.SaveCredentials)
+	r.GET("/models/weknoracloud/status", handler.Status)
+}
+
+// RegisterWikiPageRoutes registers wiki page related routes
+func RegisterWikiPageRoutes(r *gin.RouterGroup, wikiHandler *handler.WikiPageHandler) {
+	wiki := r.Group("/knowledgebase/:kb_id/wiki")
+	{
+		// Page CRUD
+		wiki.GET("/pages", wikiHandler.ListPages)
+		wiki.POST("/pages", wikiHandler.CreatePage)
+		wiki.GET("/pages/*slug", wikiHandler.GetPage)
+		wiki.PUT("/pages/*slug", wikiHandler.UpdatePage)
+		wiki.DELETE("/pages/*slug", wikiHandler.DeletePage)
+
+		// Special pages
+		wiki.GET("/index", wikiHandler.GetIndex)
+		wiki.GET("/log", wikiHandler.GetLog)
+
+		// Graph and stats
+		wiki.GET("/graph", wikiHandler.GetGraph)
+		wiki.GET("/stats", wikiHandler.GetStats)
+
+		// Search and maintenance
+		wiki.GET("/search", wikiHandler.SearchPages)
+		wiki.POST("/rebuild-links", wikiHandler.RebuildLinks)
+		wiki.GET("/lint", wikiHandler.Lint)
+		wiki.POST("/auto-fix", wikiHandler.AutoFix)
+
+		// Issues
+		wiki.GET("/issues", wikiHandler.ListIssues)
+		wiki.PUT("/issues/:issue_id/status", wikiHandler.UpdateIssueStatus)
 	}
 }

@@ -166,7 +166,7 @@ func createAgentQueryEvent(sessionID, assistantMessageID string) interfaces.Stre
 }
 
 // createUserMessage creates a user message and returns the created message.
-func (h *Handler) createUserMessage(ctx context.Context, sessionID, query, requestID string, mentionedItems types.MentionedItems, images types.MessageImages, channel string) (*types.Message, error) {
+func (h *Handler) createUserMessage(ctx context.Context, sessionID, query, requestID string, mentionedItems types.MentionedItems, images types.MessageImages, attachments types.MessageAttachments, channel string) (*types.Message, error) {
 	return h.messageService.CreateMessage(ctx, &types.Message{
 		SessionID:      sessionID,
 		Role:           "user",
@@ -176,6 +176,7 @@ func (h *Handler) createUserMessage(ctx context.Context, sessionID, query, reque
 		IsCompleted:    true,
 		MentionedItems: mentionedItems,
 		Images:         images,
+		Attachments:    attachments,
 		Channel:        channel,
 	})
 }
@@ -212,9 +213,13 @@ func (h *Handler) setupStopEventHandler(
 	eventBus.On(event.EventStop, func(ctx context.Context, evt event.Event) error {
 		logger.Infof(ctx, "Received stop event, cancelling async operations for session: %s", sessionID)
 		cancel()
-		assistantMessage.Content = "用户停止了本次对话"
-		// Use session's tenant for message update (ctx may have effectiveTenantID when using shared agent)
-		updateCtx := context.WithValue(ctx, types.TenantIDContextKey, sessionTenantID)
+		// Preserve whatever has been streamed so far; do not overwrite Content.
+		// Use session's tenant for message update (ctx may have effectiveTenantID when using shared agent).
+		// Use WithoutCancel so the GORM UPDATE survives the upcoming ctx.Done triggered by cancel()/client disconnect.
+		updateCtx := context.WithValue(
+			context.WithoutCancel(ctx),
+			types.TenantIDContextKey, sessionTenantID,
+		)
 		h.completeAssistantMessage(updateCtx, assistantMessage, "") // empty query: stopped conversations are not indexed
 		return nil
 	})
