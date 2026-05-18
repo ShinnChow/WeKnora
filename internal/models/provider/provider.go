@@ -15,6 +15,8 @@ type ProviderName string
 const (
 	// OpenAI
 	ProviderOpenAI ProviderName = "openai"
+	// Anthropic Claude
+	ProviderAnthropic ProviderName = "anthropic"
 	// 阿里云 DashScope
 	ProviderAliyun ProviderName = "aliyun"
 	// 智谱AI (GLM 系列)
@@ -57,12 +59,15 @@ const (
 	ProviderNvidia ProviderName = "nvidia"
 	// Novita AI
 	ProviderNovita ProviderName = "novita"
+	// Azure OpenAI
+	ProviderAzureOpenAI ProviderName = "azure_openai"
 )
 
 // AllProviders 返回所有注册的提供者名称
 func AllProviders() []ProviderName {
 	return []ProviderName{
 		ProviderGeneric,
+		ProviderWeKnoraCloud,
 		ProviderAliyun,
 		ProviderZhipu,
 		ProviderVolcengine,
@@ -75,6 +80,7 @@ func AllProviders() []ProviderName {
 		ProviderQianfan,
 		ProviderQiniu,
 		ProviderOpenAI,
+		ProviderAnthropic,
 		ProviderGemini,
 		ProviderOpenRouter,
 		ProviderJina,
@@ -84,6 +90,7 @@ func AllProviders() []ProviderName {
 		ProviderGPUStack,
 		ProviderNvidia,
 		ProviderNovita,
+		ProviderAzureOpenAI,
 	}
 }
 
@@ -221,8 +228,12 @@ func DetectProvider(baseURL string) ProviderName {
 		return ProviderSiliconFlow
 	case containsAny(baseURL, "api.jina.ai"):
 		return ProviderJina
+	case containsAny(baseURL, "openai.azure.com"):
+		return ProviderAzureOpenAI
 	case containsAny(baseURL, "api.openai.com"):
 		return ProviderOpenAI
+	case containsAny(baseURL, "api.anthropic.com"):
+		return ProviderAnthropic
 	case containsAny(baseURL, "api.deepseek.com"):
 		return ProviderDeepSeek
 	case containsAny(baseURL, "generativelanguage.googleapis.com"):
@@ -253,6 +264,8 @@ func DetectProvider(baseURL string) ProviderName {
 		return ProviderNvidia
 	case containsAny(baseURL, "api.novita.ai", "novita.ai"):
 		return ProviderNovita
+	case containsAny(baseURL, "weknora.weixin.qq.com"):
+		return ProviderWeKnoraCloud
 	default:
 		return ProviderGeneric
 	}

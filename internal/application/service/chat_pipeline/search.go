@@ -9,6 +9,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/searchutil"
+	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
@@ -23,6 +24,7 @@ type PluginSearch struct {
 	tenantService         interfaces.TenantService
 	sessionService        interfaces.SessionService
 	webSearchStateService interfaces.WebSearchStateService
+	webSearchProviderRepo interfaces.WebSearchProviderRepository
 }
 
 func NewPluginSearch(eventManager *EventManager,
@@ -34,6 +36,7 @@ func NewPluginSearch(eventManager *EventManager,
 	tenantService interfaces.TenantService,
 	sessionService interfaces.SessionService,
 	webSearchStateService interfaces.WebSearchStateService,
+	webSearchProviderRepo interfaces.WebSearchProviderRepository,
 ) *PluginSearch {
 	res := &PluginSearch{
 		knowledgeBaseService:  knowledgeBaseService,
@@ -44,6 +47,7 @@ func NewPluginSearch(eventManager *EventManager,
 		tenantService:         tenantService,
 		sessionService:        sessionService,
 		webSearchStateService: webSearchStateService,
+		webSearchProviderRepo: webSearchProviderRepo,
 	}
 	eventManager.Register(res)
 	return res
@@ -608,6 +612,8 @@ func (p *PluginSearch) tryDirectChunkLoading(ctx context.Context, tenantID uint6
 		results = append(results, res)
 	}
 
+	searchutil.EnrichSearchResultsImageInfo(ctx, p.chunkService.GetRepository(), tenantID, results)
+
 	return results, skippedIDs
 }
 
@@ -617,18 +623,41 @@ func (p *PluginSearch) searchWebIfEnabled(ctx context.Context, chatManage *types
 		return nil
 	}
 	tenant, _ := types.TenantInfoFromContext(ctx)
-	if tenant == nil || tenant.WebSearchConfig == nil || tenant.WebSearchConfig.Provider == "" {
+	providerID := chatManage.WebSearchProviderID
+
+	if providerID == "" {
 		pipelineWarn(ctx, "Search", "web_config_missing", map[string]interface{}{
 			"tenant_id": chatManage.TenantID,
 		})
 		return nil
 	}
 
+	webConfig := types.EffectiveWebSearchConfig(nil)
+	if tenant != nil {
+		webConfig = types.EffectiveWebSearchConfig(tenant.WebSearchConfig)
+	}
+
+	// Apply agent-level web search overrides
+	if chatManage.WebSearchMaxResults > 0 {
+		webConfig.MaxResults = chatManage.WebSearchMaxResults
+	}
+
 	pipelineInfo(ctx, "Search", "web_request", map[string]interface{}{
-		"tenant_id": chatManage.TenantID,
-		"provider":  tenant.WebSearchConfig.Provider,
+		"tenant_id":   chatManage.TenantID,
+		"provider_id": providerID,
 	})
-	webResults, err := p.webSearchService.Search(ctx, tenant.WebSearchConfig, chatManage.RewriteQuery)
+	webCtx, webSpan := langfuse.GetManager().StartSpan(ctx, langfuse.SpanOptions{
+		Name: "web_search",
+		Input: map[string]interface{}{
+			"provider_id": providerID,
+			"query":       chatManage.RewriteQuery,
+			"max_results": webConfig.MaxResults,
+		},
+	})
+	webResults, err := p.webSearchService.Search(webCtx, providerID, webConfig, chatManage.RewriteQuery)
+	webSpan.Finish(map[string]interface{}{
+		"hit_count": len(webResults),
+	}, nil, err)
 	if err != nil {
 		pipelineWarn(ctx, "Search", "web_search_error", map[string]interface{}{
 			"tenant_id": chatManage.TenantID,
@@ -637,22 +666,22 @@ func (p *PluginSearch) searchWebIfEnabled(ctx context.Context, chatManage *types
 		return nil
 	}
 	// Build questions using RewriteQuery only
-	questions := []string{strings.TrimSpace(chatManage.RewriteQuery)}
+	// questions := []string{strings.TrimSpace(chatManage.RewriteQuery)}
 	// Load session-scoped temp KB state from Redis using WebSearchStateRepository
-	tempKBID, seen, ids := p.webSearchStateService.GetWebSearchTempKBState(ctx, chatManage.SessionID)
-	compressed, kbID, newSeen, newIDs, err := p.webSearchService.CompressWithRAG(
-		ctx, chatManage.SessionID, tempKBID, questions, webResults, tenant.WebSearchConfig,
-		p.knowledgeBaseService, p.knowledgeService, seen, ids,
-	)
-	if err != nil {
-		pipelineWarn(ctx, "Search", "web_compress_error", map[string]interface{}{
-			"error": err.Error(),
-		})
-	} else {
-		webResults = compressed
-		// Persist temp KB state back into Redis using WebSearchStateRepository
-		p.webSearchStateService.SaveWebSearchTempKBState(ctx, chatManage.SessionID, kbID, newSeen, newIDs)
-	}
+	// tempKBID, seen, ids := p.webSearchStateService.GetWebSearchTempKBState(ctx, chatManage.SessionID)
+	// compressed, kbID, newSeen, newIDs, err := p.webSearchService.CompressWithRAG(
+	// 	ctx, chatManage.SessionID, tempKBID, questions, webResults, webConfig,
+	// 	p.knowledgeBaseService, p.knowledgeService, seen, ids,
+	// )
+	// if err != nil {
+	// 	pipelineWarn(ctx, "Search", "web_compress_error", map[string]interface{}{
+	// 		"error": err.Error(),
+	// 	})
+	// } else {
+	// 	webResults = compressed
+	// 	// Persist temp KB state back into Redis using WebSearchStateRepository
+	// 	p.webSearchStateService.SaveWebSearchTempKBState(ctx, chatManage.SessionID, kbID, newSeen, newIDs)
+	// }
 	res := searchutil.ConvertWebSearchResults(webResults)
 	pipelineInfo(ctx, "Search", "web_hits", map[string]interface{}{
 		"hit_count": len(res),

@@ -55,23 +55,29 @@ type KnowledgeService interface {
 	GetKnowledgeByID(ctx context.Context, id string) (*types.Knowledge, error)
 	// GetKnowledgeByIDOnly retrieves knowledge by ID without tenant filter (for permission resolution).
 	GetKnowledgeByIDOnly(ctx context.Context, id string) (*types.Knowledge, error)
+	// GetOwningKBCreatorID resolves a knowledge ID to the CreatorID of its
+	// owning KnowledgeBase, scoped to the caller's tenant. Used by the
+	// per-KB ownership lookups in handler/rbac_lookups.go (PR 5, #1303) so
+	// chunk and knowledge sub-resource routes can inherit the same
+	// "creator-of-the-KB OR Admin+" gate that KB-level routes already use.
+	// Returns the underlying repository sentinel errors unchanged so
+	// callers can map them to middleware.ErrResourceNotFound.
+	GetOwningKBCreatorID(ctx context.Context, knowledgeID string) (string, error)
 	// GetKnowledgeBatch retrieves a batch of knowledge by IDs.
 	GetKnowledgeBatch(ctx context.Context, tenantID uint64, ids []string) ([]*types.Knowledge, error)
 	// GetKnowledgeBatchWithSharedAccess retrieves knowledge by IDs including items from shared KBs the user has access to.
 	GetKnowledgeBatchWithSharedAccess(ctx context.Context, tenantID uint64, ids []string) ([]*types.Knowledge, error)
 	// ListKnowledgeByKnowledgeBaseID lists all knowledge under a knowledge base.
 	ListKnowledgeByKnowledgeBaseID(ctx context.Context, kbID string) ([]*types.Knowledge, error)
-	// ListPagedKnowledgeByKnowledgeBaseID lists all knowledge under a knowledge base with pagination.
-	// When tagID is non-empty, results are filtered by tag_id.
-	// When keyword is non-empty, results are filtered by file_name.
-	// When fileType is non-empty, results are filtered by file_type or type.
+	// ListPagedKnowledgeByKnowledgeBaseID lists all knowledge under a knowledge base
+	// with pagination. The filter struct controls optional dimensions (tag, keyword,
+	// file type, parse status, source channel, updated time range); pass a zero
+	// struct to disable all filters.
 	ListPagedKnowledgeByKnowledgeBaseID(
 		ctx context.Context,
 		kbID string,
 		page *types.Pagination,
-		tagID string,
-		keyword string,
-		fileType string,
+		filter types.KnowledgeListFilter,
 	) (*types.PageResult, error)
 	// DeleteKnowledge deletes knowledge by ID.
 	DeleteKnowledge(ctx context.Context, id string) error
@@ -128,7 +134,9 @@ type KnowledgeService interface {
 	// ExportFAQEntries exports all FAQ entries for a knowledge base as CSV data.
 	ExportFAQEntries(ctx context.Context, kbID string) ([]byte, error)
 	// UpdateKnowledgeTagBatch updates tag for document knowledge items in batch.
-	UpdateKnowledgeTagBatch(ctx context.Context, updates map[string]*string) error
+	// authorizedKBID restricts all updates to knowledge items belonging to this KB;
+	// pass empty string to skip (caller must ensure authorization by other means).
+	UpdateKnowledgeTagBatch(ctx context.Context, authorizedKBID string, updates map[string]*string) error
 	// UpdateFAQEntryTagBatch updates tag for FAQ entries in batch.
 	// Key: entry seq_id, Value: tag seq_id (nil to remove tag)
 	UpdateFAQEntryTagBatch(ctx context.Context, kbID string, updates map[int64]*int64) error
@@ -176,12 +184,12 @@ type KnowledgeRepository interface {
 	// GetKnowledgeByIDOnly returns knowledge by ID without tenant filter (for permission resolution).
 	GetKnowledgeByIDOnly(ctx context.Context, id string) (*types.Knowledge, error)
 	ListKnowledgeByKnowledgeBaseID(ctx context.Context, tenantID uint64, kbID string) ([]*types.Knowledge, error)
-	// ListPagedKnowledgeByKnowledgeBaseID lists all knowledge in a knowledge base with pagination.
-	// When tagID is non-empty, results are filtered by tag_id.
-	// When keyword is non-empty, results are filtered by file_name.
-	// When fileType is non-empty, results are filtered by file_type or type.
+	// ListPagedKnowledgeByKnowledgeBaseID lists all knowledge in a knowledge base
+	// with pagination. The filter struct controls optional dimensions (tag, keyword,
+	// file type, parse status, source channel, updated time range); pass a zero
+	// struct to disable all filters.
 	ListPagedKnowledgeByKnowledgeBaseID(ctx context.Context,
-		tenantID uint64, kbID string, page *types.Pagination, tagID string, keyword string, fileType string,
+		tenantID uint64, kbID string, page *types.Pagination, filter types.KnowledgeListFilter,
 	) ([]*types.Knowledge, int64, error)
 	UpdateKnowledge(ctx context.Context, knowledge *types.Knowledge) error
 	// UpdateKnowledgeBatch updates knowledge items in batch

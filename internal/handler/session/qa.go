@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/errors"
@@ -23,6 +24,7 @@ type qaRequestContext struct {
 	c                 *gin.Context
 	sessionID         string
 	requestID         string
+	receivedAt        time.Time // Wall-clock time the handler started processing the request
 	query             string
 	session           *types.Session
 	customAgent       *types.CustomAgent
@@ -33,10 +35,17 @@ type qaRequestContext struct {
 	webSearchEnabled  bool
 	enableMemory      bool // Whether memory feature is enabled
 	mentionedItems    types.MentionedItems
-	effectiveTenantID uint64            // when using shared agent, tenant ID for model/KB/MCP resolution; 0 = use context tenant
-	images            []ImageAttachment // Uploaded images with analysis text
-	userMessageID     string            // Created user message ID (populated after createUserMessage)
-	channel           string            // Source channel: "web", "api", "im", etc.
+	effectiveTenantID uint64                   // when using shared agent, tenant ID for model/KB/MCP resolution; 0 = use context tenant
+	images            []ImageAttachment        // Uploaded images with analysis text
+	userMessageID     string                   // Created user message ID (populated after createUserMessage)
+	channel           string                   // Source channel: "web", "api", "im", etc.
+	attachments       types.MessageAttachments // Processed file attachments
+
+	// Snapshot of the request fields needed to persist the input-bar state
+	// for session restoration. Kept verbatim from the request so we record
+	// what the user had selected on the UI (not server-side resolutions).
+	reqAgentEnabled bool
+	reqAgentID      string
 }
 
 // buildQARequest converts the qaRequestContext into a types.QARequest for service invocation.
@@ -55,13 +64,17 @@ func (rc *qaRequestContext) buildQARequest() *types.QARequest {
 		UserMessageID:      rc.userMessageID,
 		WebSearchEnabled:   rc.webSearchEnabled,
 		EnableMemory:       rc.enableMemory,
+		Attachments:        rc.attachments,
 	}
 }
 
 // parseQARequest parses and validates a QA request, returns the request context
 func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestContext, *CreateKnowledgeQARequest, error) {
+	receivedAt := time.Now()
 	ctx := logger.CloneContext(c.Request.Context())
-	logger.Infof(ctx, "[%s] Start processing request", logPrefix)
+	requestID := secutils.SanitizeForLog(c.GetString(types.RequestIDContextKey.String()))
+	logger.Infof(ctx, "[%s] TTFB:start request_id=%s received_at=%d",
+		logPrefix, requestID, receivedAt.UnixMilli())
 
 	// Get session ID from URL parameter
 	sessionID := secutils.SanitizeForLog(c.Param("session_id"))
@@ -135,12 +148,85 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 		// - Normal pure-chat mode: runs in the async goroutine with progress events
 	}
 
+	// Process file attachments: decode and save to storage, extract content
+	var processedAttachments types.MessageAttachments
+	if len(request.AttachmentUploads) > 0 {
+		logger.Infof(ctx, "[%s] processing %d attachment(s)", logPrefix, len(request.AttachmentUploads))
+
+		maxSize := secutils.GetMaxFileSize()
+		for i, upload := range request.AttachmentUploads {
+			if upload.FileSize > maxSize {
+				return nil, nil, errors.NewBadRequestError(
+					fmt.Sprintf("attachment %d exceeds size limit of %dMB", i+1, secutils.GetMaxFileSizeMB()))
+			}
+		}
+
+		tenantID := c.GetUint64(types.TenantIDContextKey.String())
+
+		// Use ASR only when the agent has audio upload enabled.
+		asrModelID := ""
+		if customAgent != nil && customAgent.Config.AudioUploadEnabled && customAgent.Config.ASRModelID != "" {
+			asrModelID = customAgent.Config.ASRModelID
+		}
+
+		// Process all attachments concurrently.
+		processedAttachments = make(types.MessageAttachments, len(request.AttachmentUploads))
+		var wg sync.WaitGroup
+		errChan := make(chan error, len(request.AttachmentUploads))
+
+		for i, upload := range request.AttachmentUploads {
+			wg.Add(1)
+			go func(idx int, att AttachmentUpload) {
+				defer wg.Done()
+
+				data, err := DecodeBase64Attachment(att.Data)
+				if err != nil {
+					errChan <- fmt.Errorf("attachment %d decode failed: %w", idx+1, err)
+					return
+				}
+
+				processed, err := h.attachmentProcessor.ProcessAttachment(
+					ctx, data, att.FileName, att.FileSize, tenantID, asrModelID,
+				)
+				if err != nil {
+					errChan <- fmt.Errorf("attachment %d processing failed: %w", idx+1, err)
+					return
+				}
+
+				processedAttachments[idx] = *processed
+			}(i, upload)
+		}
+
+		wg.Wait()
+		close(errChan)
+
+		if len(errChan) > 0 {
+			err := <-errChan
+			logger.Errorf(ctx, "[%s] attachment processing failed: %v", logPrefix, err)
+			return nil, nil, errors.NewBadRequestError(fmt.Sprintf("attachment processing failed: %v", err))
+		}
+
+		logger.Infof(ctx, "[%s] all attachments processed", logPrefix)
+	}
+
+	// Resolve enable_memory:
+	//   1. Explicit value in request → honour it. Used by embedded mode
+	//      (force false) and by older clients still sending the literal bool.
+	//   2. Not set → fall back to the calling user's stored preference.
+	//      The toggle is persisted server-side per user (see PUT
+	//      /auth/me/preferences); this is the canonical path for the
+	//      normal logged-in web UI now that it no longer sends the field.
+	//   3. No user / no preference → false. API-key-only callers never
+	//      had memory enabled in practice, keep that behaviour.
+	enableMemory := h.resolveEnableMemory(ctx, request.EnableMemory)
+
 	// Build request context
 	reqCtx := &qaRequestContext{
 		ctx:         ctx,
 		c:           c,
 		sessionID:   sessionID,
-		requestID:   secutils.SanitizeForLog(c.GetString(types.RequestIDContextKey.String())),
+		requestID:   requestID,
+		receivedAt:  receivedAt,
 		query:       secutils.SanitizeForLog(request.Query),
 		session:     session,
 		customAgent: customAgent,
@@ -155,14 +241,43 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 		knowledgeIDs:      secutils.SanitizeForLogArray(knowledgeIDs),
 		summaryModelID:    secutils.SanitizeForLog(request.SummaryModelID),
 		webSearchEnabled:  request.WebSearchEnabled,
-		enableMemory:      request.EnableMemory,
+		enableMemory:      enableMemory,
 		mentionedItems:    convertMentionedItems(request.MentionedItems),
 		effectiveTenantID: effectiveTenantID,
 		images:            request.Images,
 		channel:           request.Channel,
+		attachments:       processedAttachments,
+		reqAgentEnabled:   request.AgentEnabled,
+		reqAgentID:        request.AgentID,
 	}
 
 	return reqCtx, &request, nil
+}
+
+// resolveEnableMemory decides whether the memory pipeline runs for this
+// request. See the call-site comment in parseQARequest for the resolution
+// order. Lookup errors are logged but never propagate — a failure to read
+// the user's preference shouldn't break the chat request itself, we just
+// fall back to false (the safe default).
+func (h *Handler) resolveEnableMemory(ctx context.Context, override *bool) bool {
+	if override != nil {
+		return *override
+	}
+	if h.userService == nil {
+		return false
+	}
+	user, err := h.userService.GetCurrentUser(ctx)
+	if err != nil {
+		// API-key-only callers or revoked sessions land here; the chat
+		// request itself stays authorised via the middleware that already
+		// ran, we just have nobody to look preferences up for.
+		logger.Debugf(ctx, "enable_memory: no user in context, defaulting to false: %v", err)
+		return false
+	}
+	if user.Preferences.EnableMemory != nil {
+		return *user.Preferences.EnableMemory
+	}
+	return false
 }
 
 // resolveAgent resolves the custom agent by ID, trying shared agent first, then own agent.
@@ -180,8 +295,8 @@ func (h *Handler) resolveAgent(ctx context.Context, c *gin.Context, agentID stri
 	userIDVal, _ := c.Get(types.UserIDContextKey.String())
 	currentTenantID := c.GetUint64(types.TenantIDContextKey.String())
 	if h.agentShareService != nil && userIDVal != nil && currentTenantID != 0 {
-		userID, _ := userIDVal.(string)
-		agent, err := h.agentShareService.GetSharedAgentForUser(ctx, userID, currentTenantID, agentID)
+		callerTenantRole := types.TenantRoleFromContext(ctx)
+		agent, err := h.agentShareService.GetSharedAgentForTenant(ctx, currentTenantID, callerTenantRole, agentID)
 		if err == nil && agent != nil {
 			effectiveTenantID = agent.TenantID
 			customAgent = agent
@@ -290,7 +405,7 @@ func (h *Handler) setupSSEStream(reqCtx *qaRequestContext, generateTitle bool) *
 
 	// Setup stream handler
 	h.setupStreamHandler(asyncCtx, reqCtx.sessionID, reqCtx.assistantMessage.ID,
-		reqCtx.requestID, reqCtx.assistantMessage, eventBus)
+		reqCtx.requestID, reqCtx.receivedAt, reqCtx.assistantMessage, eventBus)
 
 	// Generate title if needed
 	if generateTitle && reqCtx.session.Title == "" {
@@ -437,12 +552,53 @@ func (h *Handler) AgentQA(c *gin.Context) {
 			agentModeEnabled, reqCtx.customAgent.Config.AgentMode)
 	}
 
+	// Tenant-RBAC gate: block Viewers from running agents whose author
+	// has cleared RunnableByViewer. The flag exists so an admin can mark
+	// an agent as "internal tools only" without turning every viewer
+	// into a contributor. Gated behind cfg.Tenant.EnableRBAC so the
+	// check is dormant during the rollout window — same pattern as
+	// middleware/rbac.go.
+	if agentModeEnabled && reqCtx.customAgent != nil && !reqCtx.customAgent.RunnableByViewer {
+		role := types.TenantRoleFromContext(reqCtx.ctx)
+		if !role.HasPermission(types.TenantRoleContributor) {
+			if h.config != nil && h.config.Tenant.IsRBACEnforced() {
+				logger.Warnf(reqCtx.ctx,
+					"[rbac] agent run blocked: viewer cannot run runnable_by_viewer=false agent: agent=%s role=%s",
+					reqCtx.customAgent.ID, role)
+				c.Error(errors.NewForbiddenError("Forbidden: this agent is restricted to contributors and above"))
+				return
+			}
+			logger.Warnf(reqCtx.ctx,
+				"[rbac] agent run would be blocked (logged, not enforced): agent=%s role=%s",
+				reqCtx.customAgent.ID, role)
+		}
+	}
+
+	// Sanity gate: agent mode requires a resolved CustomAgent. If we got
+	// here with agent_enabled=true but agent_id missing/unresolvable, the
+	// AgentQA service will fail deep inside the async goroutine with a
+	// generic "custom agent configuration is required" error and the user
+	// just sees a broken stream. Reject early with a clear 400 so the
+	// frontend can recover (e.g. fall back to quick-answer). Most likely
+	// cause is a stale localStorage settings blob where selectedAgentId
+	// got blanked but isAgentEnabled stayed true — usually after a
+	// cross-tenant switch where the previously selected agent is no
+	// longer visible.
+	if agentModeEnabled && reqCtx.customAgent == nil {
+		logger.Warnf(reqCtx.ctx,
+			"Agent mode requested without a resolvable agent_id, rejecting; session=%s, request.AgentID=%q",
+			reqCtx.sessionID, secutils.SanitizeForLog(request.AgentID))
+		c.Error(errors.NewBadRequestError(
+			"agent_id is required when agent mode is enabled"))
+		return
+	}
+
 	// Route to appropriate handler based on agent mode
 	if agentModeEnabled {
 		h.executeQA(reqCtx, qaModeAgent, true)
 	} else {
 		logger.Infof(reqCtx.ctx, "Agent mode disabled, delegating to normal mode for session: %s", reqCtx.sessionID)
-		h.executeQA(reqCtx, qaModeNormal, false)
+		h.executeQA(reqCtx, qaModeNormal, !request.DisableTitle)
 	}
 }
 
@@ -459,6 +615,13 @@ const (
 func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle bool) {
 	ctx := reqCtx.ctx
 	sessionID := reqCtx.sessionID
+
+	// Persist the input-bar state used for this request so reopening the
+	// session can rehydrate agent / model / KB / web-search / MCP selections.
+	// This is a pure UI memo (no behavioural effect) and runs in a goroutine
+	// to avoid adding a DB round-trip to TTFB. Use WithoutCancel so a fast
+	// client disconnect doesn't drop the write.
+	go h.persistLastRequestState(ctx, reqCtx, mode)
 
 	// Agent mode: emit agent query event before message creation
 	if mode == qaModeAgent {
@@ -478,7 +641,7 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 	}
 
 	// Create user message
-	userMsg, err := h.createUserMessage(ctx, sessionID, reqCtx.query, reqCtx.requestID, reqCtx.mentionedItems, convertImageAttachments(reqCtx.images), reqCtx.channel)
+	userMsg, err := h.createUserMessage(ctx, sessionID, reqCtx.query, reqCtx.requestID, reqCtx.mentionedItems, convertImageAttachments(reqCtx.images), reqCtx.attachments, reqCtx.channel)
 	if err != nil {
 		reqCtx.c.Error(errors.NewInternalServerError(err.Error()))
 		return
@@ -550,7 +713,15 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 			}
 			// Agent mode: complete the assistant message in defer (normal mode does it via event handler)
 			if mode == qaModeAgent {
-				updateCtx := context.WithValue(streamCtx.asyncCtx, types.TenantIDContextKey, reqCtx.session.TenantID)
+				// Use WithoutCancel so a user-triggered stop (which cancels
+				// asyncCtx) doesn't also cancel the GORM UPDATE that persists
+				// AgentSteps/Content. Without this, cancelled-ctx makes
+				// GORM skip the write and the agent's intermediate steps
+				// (thinking / tool_call history) are lost on page refresh.
+				updateCtx := context.WithValue(
+					context.WithoutCancel(streamCtx.asyncCtx),
+					types.TenantIDContextKey, reqCtx.session.TenantID,
+				)
 				h.completeAssistantMessage(updateCtx, streamCtx.assistantMessage, reqCtx.query)
 				logger.Infof(streamCtx.asyncCtx, "Agent QA service completed for session: %s", sessionID)
 			}
@@ -659,6 +830,38 @@ func (h *Handler) runVLMAnalysisIfNeeded(streamCtx *sseStreamContext, reqCtx *qa
 			Iteration:  iteration,
 		},
 	})
+}
+
+// persistLastRequestState records the input-bar state the user just sent so
+// that reopening this session restores agent/model/KB/web-search/MCP picks.
+// Pure UI memo — failures are logged but never bubble up; the caller runs
+// this in a goroutine and is safe to discard the returned context.
+func (h *Handler) persistLastRequestState(parentCtx context.Context, reqCtx *qaRequestContext, mode qaMode) {
+	// Detach from the HTTP request lifetime: this write must survive both
+	// SSE disconnects and the parent gin context being released after the
+	// handler returns.
+	ctx := logger.CloneContext(context.WithoutCancel(parentCtx))
+
+	agentEnabled := reqCtx.reqAgentEnabled
+	// Mirror the resolution rule used in AgentQA: a resolved custom agent's
+	// agent_mode wins over the request flag. For KnowledgeQA the request
+	// itself carries agent_enabled=false, so this collapses correctly.
+	if mode == qaModeAgent && reqCtx.customAgent != nil {
+		agentEnabled = reqCtx.customAgent.IsAgentMode()
+	}
+
+	state := &types.SessionLastRequestState{
+		AgentID:          reqCtx.reqAgentID,
+		AgentEnabled:     agentEnabled,
+		ModelID:          reqCtx.summaryModelID,
+		KnowledgeBaseIDs: reqCtx.knowledgeBaseIDs,
+		KnowledgeIDs:     reqCtx.knowledgeIDs,
+		WebSearchEnabled: reqCtx.webSearchEnabled,
+	}
+
+	if err := h.sessionService.UpdateSessionLastRequestState(ctx, reqCtx.sessionID, state); err != nil {
+		logger.Warnf(ctx, "persist last_request_state failed for session %s: %v", reqCtx.sessionID, err)
+	}
 }
 
 // completeAssistantMessage marks an assistant message as complete, updates it,
